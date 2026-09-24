@@ -1,0 +1,394 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+model User {
+  id             String           @id @default(cuid())
+  email          String           @unique
+  name           String?
+  passwordHash   String
+  createdAt      DateTime         @default(now())
+  updatedAt      DateTime         @updatedAt
+
+  googleAccounts GoogleAccount[]
+  microsoftAccounts MicrosoftAccount[]
+  leads          Lead[]
+  templates      EmailTemplate[]
+  campaigns      Campaign[]
+  suppressions   Suppression[]
+  sendSettings   SendSettings?
+  dailyCounters  DailySendCounter[]
+  smtpAccounts   SmtpAccount[]
+  smsCampaigns   SmsCampaign[]
+  contacts       Contact[]
+  messages       Message[]
+  replies        Reply[]
+  smsTemplates   SmsTemplate[]
+}
+
+model GoogleAccount {
+  id                   String       @id @default(cuid())
+  userId               String
+  user                 User         @relation(fields: [userId], references: [id], onDelete: Cascade)
+  googleEmail          String       @unique
+  accessTokenEncrypted String
+  refreshTokenEncrypted String?
+  expiresAt            DateTime?
+  scopes               String[]
+  signature            String?
+  createdAt            DateTime     @default(now())
+  updatedAt            DateTime     @updatedAt
+
+  campaigns Campaign[]
+
+  // Persisted rate-limit state so a restarted worker respects in-flight backoff.
+  quotaPausedUntil    DateTime?
+  quotaMessage        String?
+  consecutiveQuotaHits Int        @default(0)
+  lastQuotaAt         DateTime?
+
+  // Plain-text sender signature that wins over the Gmail-captured one.
+  signatureOverride   String?
+
+  @@index([userId])
+}
+
+model MicrosoftAccount {
+  id                   String       @id @default(cuid())
+  userId               String
+  user                 User         @relation(fields: [userId], references: [id], onDelete: Cascade)
+  microsoftEmail       String       @unique
+  displayName          String?
+  providerAccountId    String?
+  accessTokenEncrypted String
+  refreshTokenEncrypted String?
+  expiresAt            DateTime?
+  scopes               String[]
+  createdAt            DateTime     @default(now())
+  updatedAt            DateTime     @updatedAt
+
+  // "normal" = the signed-in user's own mailbox (delegated Mail.Send).
+  // "shared" = a shared/company mailbox the signed-in user has Send As /
+  //            Send on Behalf rights on (delegated Mail.Send.Shared).
+  connectMode String @default("normal")
+
+  // For "shared" accounts: the mailbox address to send FROM. This is purely a
+  // send-side "from" override and is NEVER used to authenticate.
+  sendFromEmail String?
+  // Role/permission Microsoft Graph sees this delegate hold on the shared
+  // mailbox (SendAs | SendOnBehalf), captured best-effort after connect.
+  sharePermission String?
+
+  campaigns Campaign[]
+
+  // Persisted rate-limit state so a restarted worker respects in-flight backoff.
+  quotaPausedUntil    DateTime?
+  quotaMessage        String?
+  consecutiveQuotaHits Int        @default(0)
+  lastQuotaAt         DateTime?
+
+  // Plain-text sender signature override. Microsoft Graph does not expose an
+  // inbox signature, so the app-signature or this override is used for sends.
+  signatureOverride   String?
+
+  @@index([userId])
+}
+
+model SmtpAccount {
+  id                  String             @id @default(cuid())
+  userId              String
+  user                User               @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  // Display + From address. NOTE: only the from-domain is implied by these;
+  // login identity is username + password below, encrypted at rest.
+  email               String
+  host                String
+  port                Int                @default(465)
+  security            String             @default("ssl") // ssl | starttls | none
+  usernameEncrypted   String
+  passwordEncrypted   String             // AES-256-GCM encrypted - NEVER plaintext
+
+  // Connection/test state (never exposes credentials).
+  status              String             @default("disconnected") // connecting | connected | disconnected | auth_failed
+  lastTestedAt        DateTime?
+  lastTestError       String?
+  lastSuccessFrom     String?
+
+  campaigns           Campaign[]
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([userId])
+}
+
+model SendSettings {
+  id               String   @id @default(cuid())
+  userId           String   @unique
+  user             User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  // Application-level send limits — the knob administrators change.
+  dailySendLimit       Int    @default(100)
+  messagesPerMinute    Int    @default(3)
+  minDelaySeconds      Int    @default(20)
+  maxDelaySeconds      Int    @default(60)
+  maxRetryAttempts     Int    @default(5)
+  baseRetryDelaySeconds Int   @default(60)
+  maxRetryDelaySeconds  Int   @default(3600)
+
+  // "live" sends real email via Gmail; "test" simulates without calling Gmail.
+  sendMode  String   @default("live")
+
+  updatedAt DateTime @updatedAt
+}
+
+model DailySendCounter {
+  id         String   @id @default(cuid())
+  userId     String
+  user       User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  provider   String // "google" | "microsoft"
+  accountId  String // id of the GoogleAccount or MicrosoftAccount
+  date       String // YYYY-MM-DD (UTC)
+  messagesSent    Int @default(0)
+  messagesFailed  Int @default(0)
+  messagesSkipped Int @default(0)
+  updatedAt  DateTime @updatedAt
+
+  @@unique([provider, accountId, date])
+  @@index([userId, date])
+}
+
+model Lead {
+  id           String             @id @default(cuid())
+  userId       String
+  user         User               @relation(fields: [userId], references: [id], onDelete: Cascade)
+  firstName    String
+  lastName     String?
+  email        String
+  practiceName String?
+  phone        String?
+  customField1 String?
+  customField2 String?
+  createdAt    DateTime           @default(now())
+  updatedAt    DateTime           @updatedAt
+
+  recipients CampaignRecipient[]
+
+  @@unique([userId, email])
+  @@index([userId])
+}
+
+model EmailTemplate {
+  id           String     @id @default(cuid())
+  userId       String
+  user         User       @relation(fields: [userId], references: [id], onDelete: Cascade)
+  name         String
+  subject      String
+  body         String
+  useSignature Boolean    @default(true)
+  signatureOverride String?
+  isActive     Boolean    @default(true)
+  createdAt    DateTime   @default(now())
+  updatedAt    DateTime   @updatedAt
+
+  campaigns Campaign[]
+
+  @@index([userId])
+}
+
+model Campaign {
+  id              String             @id @default(cuid())
+  userId          String
+  user            User               @relation(fields: [userId], references: [id], onDelete: Cascade)
+  name            String
+  status          String             @default("draft") // draft | active | paused | stopped | completed
+  templateId      String?
+  template        EmailTemplate?     @relation(fields: [templateId], references: [id], onDelete: SetNull)
+  googleAccountId String?
+  googleAccount   GoogleAccount?     @relation(fields: [googleAccountId], references: [id], onDelete: SetNull)
+  microsoftAccountId String?
+  smtpAccountId String?
+  microsoftAccount MicrosoftAccount? @relation(fields: [microsoftAccountId], references: [id], onDelete: SetNull)
+  smtpAccount   SmtpAccount? @relation(fields: [smtpAccountId], references: [id], onDelete: SetNull)
+
+  recipients CampaignRecipient[]
+
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+  startedAt   DateTime?
+  stoppedAt   DateTime?
+  completedAt DateTime?
+  pausedAt    DateTime?
+  pausedReason String?
+
+  // Immutable copy of the template content taken when the campaign starts,
+  // so editing/deleting a template never changes already-sent message content.
+  templateSnapshot Json?
+
+  @@index([userId])
+  @@index([status])
+}
+
+model CampaignRecipient {
+  id               String   @id @default(cuid())
+  campaignId       String
+  campaign         Campaign @relation(fields: [campaignId], references: [id], onDelete: Cascade)
+  leadId           String?
+  lead             Lead?    @relation(fields: [leadId], references: [id], onDelete: SetNull)
+  recipient        String
+  subject          String?
+  status           String   @default("pending") // pending | sending | sent | failed | skipped
+  attempts         Int      @default(0)
+  lastError        String?
+  nextAttemptAt    DateTime?
+  sentAt           DateTime?
+  googleMessageId  String?
+  isTest           Boolean  @default(false)
+  createdAt        DateTime @default(now())
+  updatedAt        DateTime @updatedAt
+
+  @@index([campaignId])
+  @@index([status])
+  @@index([recipient])
+  @@unique([campaignId, recipient])
+}
+
+model Suppression {
+  id        String   @id @default(cuid())
+  userId    String
+  user      User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  email     String
+  reason    String?
+  createdAt DateTime @default(now())
+
+  @@unique([userId, email])
+  @@index([userId])
+}
+
+// ---------------------------------------------------------------------------
+// SMS (8x8 Connect)
+// ---------------------------------------------------------------------------
+
+model SmsCampaign {
+  id            String    @id @default(cuid())
+  userId        String
+  user          User      @relation(fields: [userId], references: [id], onDelete: Cascade)
+  name          String
+  message       String
+  status        String    @default("draft") // draft | scheduled | sending | sent | failed
+  source        String    @default("8x8") // sending phone number / sender ID
+  x8BatchId     String?
+  createdAt     DateTime  @default(now())
+  updatedAt     DateTime  @updatedAt
+  scheduledAt   DateTime?
+  completedAt   DateTime?
+
+  messages Message[]
+  replies  Reply[]
+
+  @@index([userId])
+  @@index([status])
+}
+
+model Contact {
+  id          String   @id @default(cuid())
+  userId      String
+  user        User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  name        String
+  phoneNumber String
+  status      String   @default("active") // active | opted_out | invalid
+  optOut      Boolean  @default(false)
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+
+  messages Message[]
+  replies  Reply[]
+
+  @@unique([userId, phoneNumber])
+  @@index([userId])
+}
+
+model Message {
+  id           String       @id @default(cuid())
+  userId       String
+  user         User         @relation(fields: [userId], references: [id], onDelete: Cascade)
+  campaignId   String?
+  campaign     SmsCampaign? @relation(fields: [campaignId], references: [id], onDelete: SetNull)
+  contactId    String?
+  contact      Contact?     @relation(fields: [contactId], references: [id], onDelete: SetNull)
+  x8MessageId  String?
+  phoneNumber  String
+  message      String
+  direction    String       @default("outbound") // outbound | inbound
+  status       String       @default("queued") // queued | sent | delivered | undelivered | failed | rejected
+  source       String?
+  lastError    String?
+  sentAt       DateTime?
+  deliveredAt  DateTime?
+  failedAt     DateTime?
+  createdAt    DateTime     @default(now())
+  updatedAt    DateTime     @updatedAt
+
+  replies Reply[]
+  webhookEvents WebhookEvent[]
+  @@index([userId])
+  @@index([campaignId])
+  @@index([x8MessageId])
+  @@index([phoneNumber])
+  @@index([createdAt])
+}
+
+model Reply {
+  id          String       @id @default(cuid())
+  userId      String
+  user        User         @relation(fields: [userId], references: [id], onDelete: Cascade)
+  messageId   String?
+  thread      Message?     @relation(fields: [messageId], references: [id], onDelete: SetNull)
+  campaignId  String?
+  campaign    SmsCampaign? @relation(fields: [campaignId], references: [id], onDelete: SetNull)
+  contactId   String?
+  contact     Contact?     @relation(fields: [contactId], references: [id], onDelete: SetNull)
+  phoneNumber String
+  message     String
+  receivedAt  DateTime     @default(now())
+
+  @@index([userId])
+  @@index([phoneNumber])
+  @@index([receivedAt])
+}
+
+model WebhookEvent {
+  id           String   @id @default(cuid())
+  userId       String?
+  eventType    String
+  x8MessageId  String?
+  payload      Json
+  processed    Boolean  @default(false)
+  error        String?
+  createdAt    DateTime @default(now())
+
+  messageId String?
+  message   Message? @relation(fields: [messageId], references: [id], onDelete: SetNull)
+
+  @@index([eventType])
+  @@index([x8MessageId])
+  @@index([processed])
+}
+
+model SmsTemplate {
+  id        String   @id @default(cuid())
+  userId    String
+  user      User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  name      String
+  message   String
+  isActive  Boolean  @default(true)
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([userId])
+}

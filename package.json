@@ -1,0 +1,57 @@
+{
+  "name": "star-billing-outreach",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Gmail outreach application for Star Billing (RCM lead outreach)",
+  "scripts": {
+    "postinstall": "prisma generate",
+    "dev": "next dev -p 3002",
+    "build": "prisma generate && next build",
+    "start": "next start",
+    "lint": "next lint",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "db:push": "prisma db push",
+    "db:migrate": "prisma migrate dev",
+    "db:seed": "prisma db seed",
+    "worker": "tsx scripts/worker.ts"
+  },
+  "prisma": {
+    "seed": "tsx prisma/seed.ts"
+  },
+  "dependencies": {
+    "@prisma/client": "^5.22.0",
+    "@types/nodemailer": "^8.0.1",
+    "bcryptjs": "^2.4.3",
+    "dotenv": "^16.4.5",
+    "googleapis": "^140.0.0",
+    "jose": "^5.9.6",
+    "next": "14.2.35",
+    "nodemailer": "^10.0.10",
+    "papaparse": "^5.4.1",
+    "react": "^18.3.1",
+    "react-dom": "^18.3.1",
+    "zod": "^3.23.8"
+  },
+  "devDependencies": {
+    "@types/bcryptjs": "^2.4.6",
+    "@types/node": "^20.14.0",
+    "@types/papaparse": "^5.3.14",
+    "@types/react": "^18.3.3",
+    "@types/react-dom": "^18.3.0",
+    "autoprefixer": "^10.4.20",
+    "embedded-postgres": "^18.4.0-beta.17",
+    "eslint": "^8.57.0",
+    "eslint-config-next": "14.2.15",
+    "pg": "^8.23.0",
+    "postcss": "^8.4.41",
+    "prisma": "^5.22.0",
+    "tailwindcss": "^3.4.10",
+    "tsx": "^4.19.0",
+    "typescript": "^5.5.4",
+    "vitest": "^2.1.1"
+  },
+  "allowScripts": {
+    "@embedded-postgres/windows-x64@18.4.0-beta.17": true
+  }
+}
