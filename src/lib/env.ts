@@ -36,6 +36,13 @@ const envSchema = z.object({
 });
 
 function loadEnv() {
+  if (process.env.NEXT_PHASE === "phase-production-build") {
+    return envSchema.parse({
+      DATABASE_URL: "postgresql://build:build@localhost:5432/build",
+      SESSION_SECRET: "build-time-placeholder-secret-32-chars-min",
+      TOKEN_ENCRYPTION_KEY: "build-time-placeholder-key-32-chars-min!!",
+    });
+  }
   const parsed = envSchema.safeParse(process.env);
   if (!parsed.success) {
     const issues = parsed.error.issues
