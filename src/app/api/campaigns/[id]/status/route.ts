@@ -155,7 +155,13 @@ export async function POST(req: Request, { params }: { params: { id: string } })
     // campaign, and removing one cannot rewrite history.
     //
     // Already-SENT prospects keep their history and are NOT re-queued.
-    const [leads, suppressions, alreadySent] = await Promise.all([
+    //
+    // A row that has ALREADY BEEN ATTEMPTED is likewise never rebuilt. See the
+    // `attempted` block below: it is the difference between "this person has
+    // never been emailed" and "we tried to email this person and something
+    // happened", and only the second one carries a retry budget that has been
+    // partly spent and an outcome that may or may not have reached the provider.
+    const [leads, suppressions, alreadySent, attempted] = await Promise.all([
       prisma.lead.findMany({
         where: groupLeadWhere(session.sub, campaign.recipientGroupId),
       }),
@@ -170,19 +176,42 @@ export async function POST(req: Request, { params }: { params: { id: string } })
         },
         select: { recipient: true },
       }),
+      // Everything not-yet-sent that already carries a send attempt. These rows
+      // are the campaign's send-outcome history and are preserved verbatim:
+      // same row, same id, same `attempts`, same `lastError`, same
+      // `nextAttemptAt`, same status.
+      prisma.campaignRecipient.findMany({
+        where: {
+          campaignId: campaign.id,
+          status: { not: "sent" },
+          attempts: { gt: 0 },
+        },
+        select: { recipient: true, status: true },
+      }),
     ]);
 
     const sentEmails = new Set(
       alreadySent.map((r) => r.recipient.toLowerCase()),
     );
 
+    const attemptedEmails = new Set(
+      attempted.map((r) => r.recipient.toLowerCase()),
+    );
+
     const suppressedEmails = new Set(
       suppressions.map((s) => s.email.toLowerCase()),
     );
 
+    // Seeds for anyone we are not already tracking. `sent` and `attempted`
+    // addresses are excluded so `createMany` can never collide with the
+    // `@@unique([campaignId, recipient])` index or create a duplicate row.
     const seeds = buildRecipientSeeds(
       leads
-        .filter((l) => !sentEmails.has(l.email.toLowerCase()))
+        .filter(
+          (l) =>
+            !sentEmails.has(l.email.toLowerCase()) &&
+            !attemptedEmails.has(l.email.toLowerCase()),
+        )
         .map((l) => ({
           id: l.id,
           email: l.email,
@@ -197,19 +226,54 @@ export async function POST(req: Request, { params }: { params: { id: string } })
       (s) => s.status === "pending",
     ).length;
 
-    if (validCount === 0) {
+    // Preserved rows that are still eligible for the worker to pick up. A
+    // `sending` row here is the interesting one: its outcome is UNKNOWN (the
+    // lease expired before the worker could record success or failure), so it
+    // is reported to the operator rather than silently carried forward.
+    const preservedActive = attempted.filter(
+      (r) => r.status === "pending" || r.status === "sending",
+    ).length;
+    const preservedUncertain = attempted.filter(
+      (r) => r.status === "sending",
+    ).length;
+
+    // A start with nothing to send is refused -- but a campaign whose ONLY
+    // remaining work is already-attempted recipients is legitimate (that is
+    // precisely the retry-after-a-restart case), so the preserved rows count
+    // towards the guard.
+    if (validCount === 0 && preservedActive === 0) {
+      // The wording matters here. "Add contacts to the group" is actively
+      // misleading when the real reason is that every remaining recipient has
+      // already been attempted and terminally failed -- which is now reachable,
+      // because those rows are (correctly) not re-seeded any more.
       return badRequest(
-        campaign.recipientGroup
-          ? `No valid recipients in group "${campaign.recipientGroup.name}". Add contacts to the group or remove suppressions first.`
-          : "No valid recipients to send to. Add leads or remove suppressions first.",
+        attempted.length > 0
+          ? "Nothing left to send: every remaining recipient has already been attempted and has no retry left. Starting will not reset their send history."
+          : campaign.recipientGroup
+            ? `No valid recipients in group "${campaign.recipientGroup.name}". Add contacts to the group or remove suppressions first.`
+            : "No valid recipients to send to. Add leads or remove suppressions first.",
       );
     }
 
+    // The delete/re-seed is now scoped to rows that have NEVER been attempted
+    // (`attempts = 0`).
+    //
+    // Previously this deleted every non-`sent` row and rebuilt the whole seed
+    // set at `attempts = 0`. That silently reset the retry budget of every
+    // recipient that had already failed, and converted a stuck `sending` row
+    // into a pristine `pending` one -- erasing the only evidence that a send
+    // had been started at all. Restarting a campaign could therefore produce an
+    // UNBOUNDED number of sends to one address.
+    //
+    // Untouched rows are rebuilt exactly as before, so the snapshot semantics
+    // (the group is re-read on every start) are unchanged; only rows carrying
+    // send history are now exempt.
     await prisma.$transaction([
       prisma.campaignRecipient.deleteMany({
         where: {
           campaignId: campaign.id,
           status: { not: "sent" },
+          attempts: 0,
         },
       }),
       prisma.campaignRecipient.createMany({
@@ -241,12 +305,16 @@ export async function POST(req: Request, { params }: { params: { id: string } })
 
     const settings = await getSendSettings(session.sub);
 
+    const queued = validCount + preservedActive;
+
     return jsonResponse({
       ok: true,
       status: "active",
-      recipients: seeds.length,
-      estimatedSeconds:
-        seeds.length * settings.minDelaySeconds,
+      recipients: queued,
+      // Operator-visible breakdown of what the restart did NOT reset.
+      preservedRecipients: attempted.length,
+      uncertainRecipients: preservedUncertain,
+      estimatedSeconds: queued * settings.minDelaySeconds,
       sendMode: settings.sendMode,
     });
   }

@@ -7,6 +7,7 @@ import {
   buildTransporter,
   testSmtpConnection,
   sendSmtpMail,
+  summarizeSmtpSend,
   type SmtpAccountInput,
   type SmtpAccountView,
   type SmtpSecurity,
@@ -247,7 +248,9 @@ describe("smtp lib", () => {
         html: "<p>hi</p>",
         text: "hi",
       });
-      expect(result).toBeUndefined();
+      expect(result).toBeDefined();
+      expect(result.messageId).toBe("m1");
+      expect(JSON.stringify(result)).not.toContain(SECRET_PASSWORD);
       expect(mockTransporter.sendMail).toHaveBeenCalledTimes(1);
       const args = mockTransporter.sendMail.mock.calls[0][0] as {
         from: string;
@@ -276,6 +279,88 @@ describe("smtp lib", () => {
       );
       expect(err).toBeInstanceOf(SmtpError);
       expect((err as SmtpError).code).toBe("AUTH_FAILED");
+    });
+  });
+
+  /**
+   * The provider's reply was previously discarded, so the only durable record
+   * of an SMTP send was "it did not throw". These lock in that the metadata is
+   * now captured — and, just as importantly, that the unsafe parts of it are
+   * not smuggled into the persistence helper.
+   */
+  describe("sendSmtpMail — provider response metadata", () => {
+    const msg = { to: "clinic@example.com", subject: "x", html: "y" };
+
+    it("returns the Message-ID, accepted and rejected lists", async () => {
+      mockTransporter.sendMail.mockResolvedValueOnce({
+        messageId: "<abc123@mail.example.com>",
+        accepted: ["clinic@example.com"],
+        rejected: [],
+        response: "250 2.0.0 Ok: queued as 4A2B3C",
+      });
+      const result = await sendSmtpMail(decryptedAccount(), msg);
+      expect(result.messageId).toBe("<abc123@mail.example.com>");
+      expect(result.accepted).toEqual(["clinic@example.com"]);
+      expect(result.rejected).toEqual([]);
+      expect(result.response).toBe("250 2.0.0 Ok: queued as 4A2B3C");
+    });
+
+    it("surfaces a PARTIAL acceptance, which a bare 'did not throw' would hide", async () => {
+      mockTransporter.sendMail.mockResolvedValueOnce({
+        messageId: "<partial@mail.example.com>",
+        accepted: ["good@example.com"],
+        rejected: ["bad@example.com"],
+        response: "250 2.0.0 Ok",
+      });
+      const result = await sendSmtpMail(decryptedAccount(), msg);
+      expect(result.accepted).toHaveLength(1);
+      expect(result.rejected).toEqual(["bad@example.com"]);
+    });
+
+    it("tolerates a server that reports nothing at all", async () => {
+      mockTransporter.sendMail.mockResolvedValueOnce({});
+      const result = await sendSmtpMail(decryptedAccount(), msg);
+      expect(result).toEqual({
+        messageId: null,
+        accepted: [],
+        rejected: [],
+        response: undefined,
+      });
+    });
+
+    it("still closes the transporter on the success path", async () => {
+      mockTransporter.sendMail.mockResolvedValueOnce({ messageId: "m" });
+      await sendSmtpMail(decryptedAccount(), msg);
+      expect(mockTransporter.close).toHaveBeenCalled();
+    });
+  });
+
+  describe("summarizeSmtpSend", () => {
+    it("keeps the Message-ID but drops the raw response", () => {
+      const summary = summarizeSmtpSend({
+        messageId: "<keep@mail.example.com>",
+        accepted: ["a@example.com", "b@example.com"],
+        rejected: ["c@example.com"],
+        response: "250 2.0.0 Ok: queued as X user=user@example.com password=hunter2",
+      });
+      expect(summary).toEqual({
+        messageId: "<keep@mail.example.com>",
+        acceptedCount: 2,
+        rejectedCount: 1,
+      });
+      // The raw reply is the credential-leak vector: it must not survive.
+      expect(JSON.stringify(summary)).not.toContain("hunter2");
+      expect(JSON.stringify(summary)).not.toContain("user@example.com");
+    });
+
+    it("reduces addresses to counts so a log line cannot become a recipient list", () => {
+      const summary = summarizeSmtpSend({
+        messageId: null,
+        accepted: ["one@example.com"],
+        rejected: [],
+        response: undefined,
+      });
+      expect(JSON.stringify(summary)).not.toContain("one@example.com");
     });
   });
 });

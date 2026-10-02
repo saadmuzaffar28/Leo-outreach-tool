@@ -132,10 +132,10 @@ export interface RetryPolicy {
 }
 
 export type SendDecision =
-  | { action: "schedule_retry"; retryAfterSeconds: number; message: string }
-  | { action: "fail_permanent"; message: string }
-  | { action: "quota_backoff"; retryAfterSeconds: number; message: string }
-  | { action: "auth_required"; message: string };
+  | { action: "schedule_retry"; retryAfterSeconds: number; message: string; kind: SendErrorKind }
+  | { action: "fail_permanent"; message: string; kind: SendErrorKind }
+  | { action: "quota_backoff"; retryAfterSeconds: number; message: string; kind: SendErrorKind }
+  | { action: "auth_required"; message: string; kind: SendErrorKind };
 
 /**
  * Single decision point for every send failure.
@@ -143,18 +143,23 @@ export type SendDecision =
  * - auth (invalid_grant / revoked grant) → auth_required (operator must reconnect).
  * - temporary (network / 5xx / 401) → schedule_retry with exponential backoff.
  * - permanent → fail_permanent. Retry budget exhausted → fail_permanent.
+ *
+ * `kind` is carried on every variant so a caller that only logs (the worker)
+ * can report WHY a recipient failed without re-classifying the error itself —
+ * re-classification would risk the log and the decision disagreeing.
  */
 export function decideSendError(err: unknown, attemptsUsed: number, policy: RetryPolicy): SendDecision {
   const info = classifySendError(err);
 
   if (info.kind === "auth") {
-    return { action: "auth_required", message: info.message };
+    return { action: "auth_required", message: info.message, kind: info.kind };
   }
   if (info.kind === "quota") {
     return {
       action: "quota_backoff",
       retryAfterSeconds: computeBackoffSeconds(attemptsUsed, policy.baseRetryDelaySeconds, policy.maxRetryDelaySeconds),
       message: info.message,
+      kind: info.kind,
     };
   }
   if (!info.retryable || attemptsUsed >= policy.maxRetryAttempts) {
@@ -162,11 +167,12 @@ export function decideSendError(err: unknown, attemptsUsed: number, policy: Retr
       attemptsUsed >= policy.maxRetryAttempts
         ? `Gave up after ${attemptsUsed} attempt(s): ${info.message}`
         : info.message;
-    return { action: "fail_permanent", message: gaveUp };
+    return { action: "fail_permanent", message: gaveUp, kind: info.kind };
   }
   return {
     action: "schedule_retry",
     retryAfterSeconds: computeBackoffSeconds(attemptsUsed, policy.baseRetryDelaySeconds, policy.maxRetryDelaySeconds),
     message: info.message,
+    kind: info.kind,
   };
 }

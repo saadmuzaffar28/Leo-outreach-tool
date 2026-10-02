@@ -1,0 +1,27 @@
+-- Queue-selection index for processDueRecipients.
+--
+-- Chosen from measured query plans, not from the shape of the query. Candidates
+-- were benchmarked against a throwaway Postgres at 300k recipients / 200
+-- campaigns and again at production's actual 680 rows:
+--
+--   (campaignId, status, nextAttemptAt, createdAt)    85.028 ms  (Seq Scan + Sort)
+--   (campaignId, status, nextAttemptAt, createdAt, id) 84.753 ms (Seq Scan + Sort)
+--   (status, nextAttemptAt, createdAt, id)             83.223 ms (Seq Scan + Sort)
+--   (createdAt, id)                                     0.094 ms (Index Scan)
+--   baseline, no candidate index                       66.117 ms (Seq Scan + Sort)
+--
+-- The query orders by `createdAt, id` across ALL active campaigns, so a
+-- campaignId- or status-leading index cannot deliver rows in that order. The
+-- planner then has to read every matching row and sort it. Only a
+-- createdAt-leading index returns rows already in sort order, which lets the
+-- scan stop at LIMIT 10 instead of materialising the whole queue.
+--
+-- `id` is included because it is the tie-breaker that makes the ordering a
+-- TOTAL order. Without it, the index cannot break ties between rows sharing a
+-- createdAt (and processDueRecipients takes exactly 10 of them per tick).
+--
+-- CONCURRENTLY: this runs on a live table in a running application. The
+-- non-concurrent form takes a SHARE lock that blocks writes for the duration,
+-- so a plain CREATE INDEX here would stall the send worker.
+CREATE INDEX CONCURRENTLY IF NOT EXISTS "CampaignRecipient_createdAt_id_idx"
+  ON "CampaignRecipient" ("createdAt", "id");

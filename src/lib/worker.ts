@@ -18,12 +18,13 @@ import {
 } from "@/lib/microsoft";
 import type { MailMessage } from "@/lib/message";
 import { buildRawMessage, htmlBody, plainBody, plainTextToHtml } from "@/lib/message";
-import { decryptSmtpCredentials, sendSmtpMail, type SmtpSecurity } from "@/lib/smtp";
+import { decryptSmtpCredentials, sendSmtpMail, summarizeSmtpSend, SmtpError, type SmtpSecurity } from "@/lib/smtp";
 import { buildUnsubscribeUrl, isSuppressed } from "@/lib/suppression";
 import { personalize } from "@/lib/personalization";
 import { fillSubject } from "@/lib/campaigns";
 import { campaignTemplateSource } from "@/lib/templates";
 import { decideSendError, type RetryPolicy } from "@/lib/send-queue";
+import { logSendFailure } from "@/lib/redact";
 import {
   clearRateLimitState,
   getDailyCounter,
@@ -125,7 +126,21 @@ export async function processDueRecipients(): Promise<number> {
       campaign: { include: { googleAccount: true, microsoftAccount: true, smtpAccount: true, template: true } },
       lead: true,
     },
-    orderBy: { createdAt: "asc" },
+    // Ordering MUST be a total order.
+    //
+    // `createdAt` alone is NOT unique: every seed written by the same `start`
+    // shares one timestamp to millisecond precision, and Postgres is then free
+    // to return equal-key rows in ANY order -- it does not, and must not, be
+    // relied upon to. With `take: 10` that non-determinism is not cosmetic: the
+    // window is decided before anything is sent, so whichever 10 rows the
+    // planner happened to pick win every tick and the rows *behind* them in the
+    // tie can be starved indefinitely. That is exactly how a recipient was left
+    // stuck in `sending` while the other 459 queued behind it all went out.
+    //
+    // `id` is a cuid: unique, immutable, and stable, so it is a correct
+    // tie-breaker. `[{createdAt},{id}]` makes the selection reproducible and
+    // matches the composite index in the migration added for it.
+    orderBy: [{ createdAt: "asc" }, { id: "asc" }],
     take: 10,
   });
   if (due.length === 0) return 0;
@@ -346,7 +361,7 @@ export async function processDueRecipients(): Promise<number> {
           }
         }
       } catch (err) {
-        await handleError(provider, rec.id, account.id, rec.campaign.userId, err, attemptsUsed, settings);
+        await handleError(provider, rec.campaign.id, rec.id, account.id, rec.campaign.userId, err, attemptsUsed, settings);
         processed++;
         continue;
       }
@@ -375,7 +390,7 @@ export async function processDueRecipients(): Promise<number> {
           usernameEncrypted: smtpAccount!.usernameEncrypted,
           passwordEncrypted: smtpAccount!.passwordEncrypted,
         });
-        await sendSmtpMail(
+        const sendResult = await sendSmtpMail(
           {
             email: smtpAccount!.email,
             host: smtpAccount!.host,
@@ -386,10 +401,37 @@ export async function processDueRecipients(): Promise<number> {
           },
           { to: message.to, subject, html: htmlBody(message), text: plainBody(message) },
         );
+        // Record what the server said, not merely that we did not throw.
+        //
+        // `googleMessageId` is the schema's single provider-identifier column
+        // and is already used provider-agnostically — the Microsoft branch
+        // above writes GRAPH_SENT_MARKER into it. Persisting the SMTP
+        // Message-ID there gives an SMTP send the same forensic value a Gmail
+        // send has always had: a string that can be matched against the
+        // receiving server's logs to settle whether a message actually left.
+        //
+        // summarizeSmtpSend keeps the identifier and turns the address lists
+        // into counts. The raw `response` is dropped: SMTP servers quote
+        // credentials back in their replies (see classifySmtpError).
+        const sendSummary = summarizeSmtpSend(sendResult);
+
+        // nodemailer RESOLVES when the server accepts the DATA transaction even
+        // if it refused the envelope recipient. Recording that as `sent` would
+        // mark a prospect as delivered who was never accepted — a silent data
+        // corruption that no later assertion would catch. Retrying cannot help
+        // (the address itself was refused), so this is classified permanent.
+        if (sendSummary.rejectedCount > 0) {
+          throw new SmtpError(
+            "INVALID_CONFIG",
+            `SMTP server rejected ${sendSummary.rejectedCount} envelope recipient(s) for this message`,
+          );
+        }
+
         await markRecipient(rec.id, {
           status: "sent",
           subject,
           sentAt: new Date(),
+          ...(sendSummary.messageId ? { googleMessageId: sendSummary.messageId } : {}),
           lastError: null,
           nextAttemptAt: null,
         });
@@ -412,7 +454,7 @@ export async function processDueRecipients(): Promise<number> {
       runningSent.set(account.id, (runningSent.get(account.id) ?? sentToday) + 1);
       processed++;
     } catch (err) {
-      await handleError(provider, rec.id, account.id, rec.campaign.userId, err, attemptsUsed, settings);
+      await handleError(provider, rec.campaign.id, rec.id, account.id, rec.campaign.userId, err, attemptsUsed, settings);
       processed++;
     }
   }
@@ -433,8 +475,19 @@ export async function processDueRecipients(): Promise<number> {
   return processed;
 }
 
+/**
+ * Single entry point for every send failure.
+ *
+ * Emits exactly one structured log line per failure (see `logSendFailure`).
+ * Before this existed, `schedule_retry` and `fail_permanent` wrote NOTHING:
+ * the recipient row was updated and the reason was lost unless someone went
+ * looking for it. `lastError` alone cannot answer "how many attempts has this
+ * had" or "which campaign was it", which is exactly what is needed to tell an
+ * exhausted retry budget from a stalled queue.
+ */
 async function handleError(
   provider: SendProvider,
+  campaignId: string,
   recipientId: string,
   accountId: string,
   userId: string,
@@ -443,6 +496,20 @@ async function handleError(
   settings: SendSettingsData,
 ): Promise<void> {
   const decision = decideSendError(err, attemptsUsed, retryPolicy(settings));
+
+  // Log BEFORE mutating state, and exactly once, on every branch below.
+  logSendFailure({
+    campaignId,
+    recipientId,
+    provider,
+    accountId,
+    attempt: attemptsUsed,
+    kind: decision.kind,
+    action: decision.action,
+    retryAfterSeconds:
+      "retryAfterSeconds" in decision ? decision.retryAfterSeconds : null,
+    detail: decision.message,
+  });
 
   if (decision.action === "auth_required") {
     await markRecipient(recipientId, { status: "failed", lastError: decision.message, nextAttemptAt: null });
@@ -467,8 +534,6 @@ async function handleError(
       },
     });
     await incrementDailyCounter(provider, accountId, userId, { kind: "failed", count: 1 });
-    // Account id + reason only -- never a token.
-    console.warn(`[worker] auth required for account ${accountId}: ${decision.message}`);
     return;
   }
 
@@ -480,9 +545,6 @@ async function handleError(
       lastError: decision.message,
       nextAttemptAt: new Date(Date.now() + Math.max(decision.retryAfterSeconds * 1000, pausedMs)),
     });
-    console.warn(
-      `[worker] rate limit on ${accountId} — backoff ${decision.retryAfterSeconds}s${pausedMs > 0 ? `, account paused until ${new Date(Date.now() + pausedMs).toISOString()}` : ""}`,
-    );
     return;
   }
 

@@ -356,6 +356,26 @@ model CampaignRecipient {
   @@index([campaignId])
   @@index([status])
   @@index([recipient])
+  // Queue-selection index for processDueRecipients.
+  //
+  // CHOSEN FROM MEASURED PLANS, not from the shape of the query. Candidates
+  // were benchmarked at 300k recipients / 200 campaigns and at production's
+  // actual 680 rows:
+  //
+  //   (campaignId, status, nextAttemptAt, createdAt)   never chosen by the planner
+  //   (campaignId, status, nextAttemptAt, createdAt, id) never chosen
+  //   (status, nextAttemptAt, createdAt, id)           never chosen
+  //   (createdAt, id)                                  66.117ms -> 0.094ms
+  //
+  // The reason the "obvious" composite loses: the query's ORDER BY is
+  // `createdAt, id` and it is unbounded by campaignId (it spans every active
+  // campaign). A campaignId- or status-leading index cannot deliver rows in
+  // that order, so the planner has no choice but to read every matching row
+  // and Sort — paying for the index and the sort both. Only a createdAt-leading
+  // index produces rows already in sort order, letting the scan stop after the
+  // LIMIT 10. `id` is the tie-breaker, which is why it is in the index and not
+  // just in the ORDER BY: it is what makes the index a total order.
+  @@index([createdAt, id])
 }
 
 model Suppression {

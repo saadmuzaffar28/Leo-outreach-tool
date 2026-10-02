@@ -187,7 +187,58 @@ export function sanitizeHeaderValue(value: string): string {
   return value.replace(/[\r\n]+/g, " ").trim();
 }
 
-/** Send one email through the SMTP transporter using the account's own From. */
+/**
+ * What the SMTP server actually said about a message we handed it.
+ *
+ * nodemailer returns a rich `SentMessageInfo` after a successful DATA
+ * transaction. This function used to throw that away and resolve to `void`,
+ * which meant that the only durable record of an SMTP send was "it did not
+ * throw" — with no identifier to reconcile against server-side logs, and no way
+ * to tell a partial acceptance from a full one.
+ *
+ * `response` is the server's raw final reply. It is returned for in-process
+ * diagnosis ONLY and must never be persisted or logged: SMTP servers routinely
+ * quote credentials back in their replies (see the note on `classifySmtpError`
+ * above). Use {@link summarizeSmtpSend} for anything that is written down.
+ */
+export interface SmtpSendResult {
+  /** RFC 5322 Message-ID assigned by nodemailer, or null if the server gave none. */
+  messageId: string | null;
+  /** Addresses the server accepted. Empty array means "server said OK, list unknown". */
+  accepted: string[];
+  /** Addresses the server rejected. Non-empty with a resolved promise is a partial send. */
+  rejected: string[];
+  /** RAW server reply. In-memory only — never persist, never log. */
+  response: string | undefined;
+}
+
+/**
+ * Reduce an {@link SmtpSendResult} to the subset that is safe to write to the
+ * database or a log line: an identifier and two counts.
+ *
+ * `response` is deliberately excluded. `accepted`/`rejected` are reduced to
+ * counts rather than addresses so a log line cannot become a recipient list.
+ */
+export function summarizeSmtpSend(
+  result: SmtpSendResult,
+): { messageId: string | null; acceptedCount: number; rejectedCount: number } {
+  return {
+    messageId: result.messageId,
+    acceptedCount: result.accepted.length,
+    rejectedCount: result.rejected.length,
+  };
+}
+
+function asStringArray(value: unknown): string[] {
+  return Array.isArray(value) ? value.map((v) => String(v)) : [];
+}
+
+/**
+ * Send one email through the SMTP transporter using the account's own From.
+ *
+ * Resolves to the server's response metadata. Callers that ignore the result
+ * are unaffected — this is purely additive over the previous `Promise<void>`.
+ */
 export async function sendSmtpMail(
   account: DecryptedSmtpAccount,
   msg: {
@@ -203,7 +254,7 @@ export async function sendSmtpMail(
      */
     headers?: Array<[string, string]>;
   }
-): Promise<void> {
+): Promise<SmtpSendResult> {
   const transporter = buildTransporter(account);
   try {
     // nodemailer takes an array of { key, value } for custom headers.
@@ -211,7 +262,7 @@ export async function sendSmtpMail(
       key: sanitizeHeaderValue(key),
       value: sanitizeHeaderValue(value),
     }));
-    await transporter.sendMail({
+    const info = await transporter.sendMail({
       from: `"${account.email.replace(/["\\]/g, "")}" <${account.email}>`,
       to: msg.to,
       subject: msg.subject,
@@ -220,6 +271,13 @@ export async function sendSmtpMail(
       replyTo: msg.replyTo,
       ...(extra.length > 0 ? { headers: extra } : {}),
     });
+
+    return {
+      messageId: typeof info?.messageId === "string" ? info.messageId : null,
+      accepted: asStringArray(info?.accepted),
+      rejected: asStringArray(info?.rejected),
+      response: typeof info?.response === "string" ? info.response : undefined,
+    };
   } catch (err) {
     throw classifySmtpError(err);
   } finally {

@@ -113,3 +113,120 @@ export async function setDailyLimit(
     create: { userId, dailySendLimit: limit, warmupEnabled },
   });
 }
+
+// ---------------------------------------------------------------------------
+// Campaign fixtures
+// ---------------------------------------------------------------------------
+
+export async function createTemplate(
+  prisma: PrismaClient,
+  userId: string,
+  opts: { name?: string; subject?: string; body?: string } = {},
+) {
+  return prisma.emailTemplate.create({
+    data: {
+      userId,
+      name: opts.name ?? uniq("tpl"),
+      subject: opts.subject ?? "Hello {{first_name}}",
+      body: opts.body ?? "<p>Hi {{first_name}}, this is a test body.</p>",
+    },
+  });
+}
+
+export async function createLead(
+  prisma: PrismaClient,
+  userId: string,
+  opts: { email?: string; firstName?: string; groupId?: string } = {},
+) {
+  const email = opts.email ?? `${uniq("lead")}@lead.example`;
+  const lead = await prisma.lead.create({
+    data: { userId, email, firstName: opts.firstName ?? "Test", lastName: "Lead" },
+  });
+  if (opts.groupId) {
+    await prisma.leadGroup.create({ data: { groupId: opts.groupId, leadId: lead.id } });
+  }
+  return lead;
+}
+
+/**
+ * SendSettings tuned so the worker will actually claim every row it selects:
+ * no per-minute throttling and no minimum delay.
+ *
+ * The in-process `SendRateLimiter` is a module-level singleton that PERSISTS
+ * across `processDueRecipients` calls within a test file, so a tick being
+ * allowed to send is a precondition for asserting anything about which rows the
+ * queue selected. These values make that precondition unconditional.
+ */
+export async function setPermissiveSendSettings(prisma: PrismaClient, userId: string, dailyLimit = 1000) {
+  const values = {
+    dailySendLimit: dailyLimit,
+    messagesPerMinute: 600,
+    minDelaySeconds: 0,
+    maxRetryAttempts: 3,
+    baseRetryDelaySeconds: 1,
+    maxRetryDelaySeconds: 10,
+    sendMode: "live",
+  };
+  return prisma.sendSettings.upsert({
+    where: { userId },
+    update: values,
+    create: { userId, ...values },
+  });
+}
+
+export async function createCampaign(
+  prisma: PrismaClient,
+  userId: string,
+  opts: {
+    name?: string;
+    status?: string;
+    templateId?: string;
+    smtpAccountId?: string;
+    groupId?: string;
+  } = {},
+) {
+  return prisma.campaign.create({
+    data: {
+      userId,
+      name: opts.name ?? uniq("campaign"),
+      status: opts.status ?? "draft",
+      templateId: opts.templateId,
+      smtpAccountId: opts.smtpAccountId,
+      recipientGroupId: opts.groupId,
+    },
+  });
+}
+
+/** Creates recipients and returns them ordered by id, so a test can assert positionally. */
+export async function createRecipients(
+  prisma: PrismaClient,
+  campaignId: string,
+  recipients: Array<{
+    email: string;
+    leadId?: string;
+    status?: string;
+    attempts?: number;
+    createdAt?: Date;
+    lastError?: string;
+    nextAttemptAt?: Date | null;
+  }>,
+) {
+  await prisma.campaignRecipient.createMany({
+    data: recipients.map((r) => ({
+      campaignId,
+      leadId: r.leadId,
+      recipient: r.email,
+      status: r.status ?? "pending",
+      attempts: r.attempts ?? 0,
+      lastError: r.lastError,
+      nextAttemptAt: r.nextAttemptAt ?? null,
+      // An explicit createdAt matters: these tests assert on ORDERING, so the
+      // clock must not be what decides it.
+      ...(r.createdAt ? { createdAt: r.createdAt } : {}),
+    })),
+  });
+  return prisma.campaignRecipient.findMany({
+    where: { campaignId },
+    orderBy: { id: "asc" },
+  });
+}
