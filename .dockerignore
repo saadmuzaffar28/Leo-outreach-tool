@@ -1,0 +1,11 @@
+.git
+.pgdata
+node_modules
+.next
+.env
+.env.*
+*.log
+*.log.*
+*.pid
+tests
+railway.json

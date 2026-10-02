@@ -1,0 +1,673 @@
+generator client {
+  provider      = "prisma-client-js"
+  binaryTargets = ["native", "debian-openssl-1.1.x", "debian-openssl-3.0.x"]
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+model User {
+  id           String   @id @default(cuid())
+  email        String   @unique
+  name         String?
+  passwordHash String
+  createdAt    DateTime @default(now())
+  updatedAt    DateTime @updatedAt
+
+  googleAccounts    GoogleAccount[]
+  microsoftAccounts MicrosoftAccount[]
+  leads             Lead[]
+  templates         EmailTemplate[]
+  campaigns         Campaign[]
+  suppressions      Suppression[]
+  sendSettings      SendSettings?
+  dailyCounters     DailySendCounter[]
+  smtpAccounts      SmtpAccount[]
+  smsCampaigns      SmsCampaign[]
+  contacts          Contact[]
+  messages          Message[]
+  replies           Reply[]
+  smsTemplates      SmsTemplate[]
+  groups            Group[]
+  warmupMailboxes   WarmupMailboxSettings[]
+  warmupJobs        WarmupJob[]
+  warmupEvents      WarmupEvent[]
+  warmupDailyUsage  WarmupDailyUsage[]
+}
+
+model GoogleAccount {
+  id                    String    @id @default(cuid())
+  userId                String
+  user                  User      @relation(fields: [userId], references: [id], onDelete: Cascade)
+  googleEmail           String    @unique
+  accessTokenEncrypted  String
+  refreshTokenEncrypted String?
+  expiresAt             DateTime?
+  scopes                String[]
+  signature             String?
+  createdAt             DateTime  @default(now())
+  updatedAt             DateTime  @updatedAt
+
+  campaigns Campaign[]
+
+  // Persisted rate-limit state so a restarted worker respects in-flight backoff.
+  quotaPausedUntil     DateTime?
+  quotaMessage         String?
+  consecutiveQuotaHits Int       @default(0)
+  lastQuotaAt          DateTime?
+
+  // Plain-text sender signature that wins over the Gmail-captured one.
+  signatureOverride String?
+
+  // Authorization health for this single account, so one dead grant never
+  // blocks the other connected Gmail accounts.
+  //   connected      - offline refresh grant is usable
+  //   token_expired  - no refresh token and the access token has expired
+  //   reauth_required- Google rejected the grant (revoked / password change)
+  // Defaults to "connected" so every pre-existing account stays healthy.
+  status        String  @default("connected")
+  statusMessage String?
+
+  @@index([userId])
+  @@index([status])
+}
+
+model MicrosoftAccount {
+  id                    String    @id @default(cuid())
+  userId                String
+  user                  User      @relation(fields: [userId], references: [id], onDelete: Cascade)
+  microsoftEmail        String    @unique
+  displayName           String?
+  providerAccountId     String?
+  accessTokenEncrypted  String
+  refreshTokenEncrypted String?
+  expiresAt             DateTime?
+  scopes                String[]
+  createdAt             DateTime  @default(now())
+  updatedAt             DateTime  @updatedAt
+
+  // "normal" = the signed-in user's own mailbox (delegated Mail.Send).
+  // "shared" = a shared/company mailbox the signed-in user has Send As /
+  //            Send on Behalf rights on (delegated Mail.Send.Shared).
+  connectMode String @default("normal")
+
+  // For "shared" accounts: the mailbox address to send FROM. This is purely a
+  // send-side "from" override and is NEVER used to authenticate.
+  sendFromEmail   String?
+  // Role/permission Microsoft Graph sees this delegate hold on the shared
+  // mailbox (SendAs | SendOnBehalf), captured best-effort after connect.
+  sharePermission String?
+
+  campaigns Campaign[]
+
+  // Persisted rate-limit state so a restarted worker respects in-flight backoff.
+  quotaPausedUntil     DateTime?
+  quotaMessage         String?
+  consecutiveQuotaHits Int       @default(0)
+  lastQuotaAt          DateTime?
+
+  // Plain-text sender signature override. Microsoft Graph does not expose an
+  // inbox signature, so the app-signature or this override is used for sends.
+  signatureOverride String?
+
+  @@index([userId])
+}
+
+model SmtpAccount {
+  id     String @id @default(cuid())
+  userId String
+  user   User   @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  // Display + From address. NOTE: only the from-domain is implied by these;
+  // login identity is username + password below, encrypted at rest.
+  email             String
+  host              String
+  port              Int    @default(465)
+  security          String @default("ssl") // ssl | starttls | none
+  usernameEncrypted String
+  passwordEncrypted String // AES-256-GCM encrypted - NEVER plaintext
+
+  // Connection/test state (never exposes credentials).
+  status          String    @default("disconnected") // connecting | connected | disconnected | auth_failed
+  lastTestedAt    DateTime?
+  lastTestError   String?
+  lastSuccessFrom String?
+
+  // ---- IMAP (mailbox warm-up delivery verification, added 2026-10-02) ----
+  // Separate host/port/security/credentials because an SMTP endpoint tells us
+  // nothing reliable about the IMAP endpoint, and some providers require a
+  // DIFFERENT login for IMAP than for SMTP. All of these are optional: a
+  // mailbox with no IMAP config can still send warm-up messages, it just
+  // cannot have its deliveries confirmed. Password stays AES-256-GCM encrypted
+  // at rest and is never returned by any API (see src/lib/imap.ts).
+  imapHost              String?
+  imapPort              Int       @default(993)
+  imapSecurity          String    @default("ssl") // ssl | starttls | none
+  imapUsernameEncrypted String? // falls back to usernameEncrypted when null
+  imapPasswordEncrypted String? // falls back to passwordEncrypted when null
+  imapStatus            String    @default("unconfigured") // unconfigured | connected | auth_failed | config_invalid
+  imapLastTestedAt      DateTime?
+  imapLastTestError     String?
+
+  campaigns      Campaign[]
+  warmupSettings WarmupMailboxSettings?
+
+  sentWarmupJobs     WarmupJob[] @relation("WarmupSender")
+  receivedWarmupJobs WarmupJob[] @relation("WarmupReceiver")
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([userId])
+}
+
+model SendSettings {
+  id     String @id @default(cuid())
+  userId String @unique
+  user   User   @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  // Application-level send limits — the knob administrators change.
+  dailySendLimit        Int @default(100)
+  messagesPerMinute     Int @default(3)
+  minDelaySeconds       Int @default(20)
+  maxDelaySeconds       Int @default(60)
+  maxRetryAttempts      Int @default(5)
+  baseRetryDelaySeconds Int @default(60)
+  maxRetryDelaySeconds  Int @default(3600)
+
+  // "live" sends real email via Gmail; "test" simulates without calling Gmail.
+  sendMode String @default("live")
+
+  // ---- Mailbox warm-up global defaults (added 2026-10-02) ----
+  // These are DEFAULTS for new mailboxes only. Each WarmupMailboxSettings row
+  // copies them on creation and can then diverge, so changing a global default
+  // never silently retunes a mailbox that is mid-ramp.
+  warmupEnabled             Boolean @default(false)
+  warmupStartingDailyVolume Int     @default(5)
+  warmupDailyIncrease       Int     @default(1)
+  warmupMaximumDailyVolume  Int     @default(15)
+  warmupMinDelaySeconds     Int     @default(60)
+  warmupMaxDelaySeconds     Int     @default(120)
+
+  updatedAt DateTime @updatedAt
+}
+
+model DailySendCounter {
+  id              String   @id @default(cuid())
+  userId          String
+  user            User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  provider        String // "google" | "microsoft"
+  accountId       String // id of the GoogleAccount or MicrosoftAccount
+  date            String // YYYY-MM-DD (UTC)
+  messagesSent    Int      @default(0)
+  messagesFailed  Int      @default(0)
+  messagesSkipped Int      @default(0)
+  updatedAt       DateTime @updatedAt
+
+  @@unique([provider, accountId, date])
+  @@index([userId, date])
+}
+
+model Lead {
+  id           String   @id @default(cuid())
+  userId       String
+  user         User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  firstName    String
+  lastName     String?
+  email        String
+  practiceName String?
+  phone        String?
+  customField1 String?
+  customField2 String?
+  createdAt    DateTime @default(now())
+  updatedAt    DateTime @updatedAt
+
+  recipients CampaignRecipient[]
+  leadGroups LeadGroup[]
+
+  @@unique([userId, email])
+  @@index([userId])
+}
+
+// ---------------------------------------------------------------------------
+// Contact groups
+// ---------------------------------------------------------------------------
+
+// A named bucket of email leads. Membership is a join table so one lead can
+// belong to several groups while still existing only once (Lead stays unique
+// on [userId, email]). Deleting a group removes join rows only - the leads
+// themselves are never touched, so they remain in "All Contacts".
+model Group {
+  id          String   @id @default(cuid())
+  userId      String
+  user        User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  name        String
+  description String?
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+
+  leadGroups LeadGroup[]
+  campaigns  Campaign[]
+
+  @@unique([userId, name])
+  @@index([userId])
+}
+
+model LeadGroup {
+  id        String   @id @default(cuid())
+  groupId   String
+  group     Group    @relation(fields: [groupId], references: [id], onDelete: Cascade)
+  leadId    String
+  lead      Lead     @relation(fields: [leadId], references: [id], onDelete: Cascade)
+  // When the lead joined this group (may predate the lead's own createdAt
+  // only in the sense of an import; kept so "Added date" is per-group).
+  createdAt DateTime @default(now())
+
+  @@unique([groupId, leadId])
+  @@index([groupId])
+  @@index([leadId])
+}
+
+model EmailTemplate {
+  id                String   @id @default(cuid())
+  userId            String
+  user              User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  name              String
+  subject           String
+  body              String
+  useSignature      Boolean  @default(true)
+  signatureOverride String?
+  isActive          Boolean  @default(true)
+  createdAt         DateTime @default(now())
+  updatedAt         DateTime @updatedAt
+
+  campaigns Campaign[]
+
+  @@index([userId])
+}
+
+model Campaign {
+  id                 String            @id @default(cuid())
+  userId             String
+  user               User              @relation(fields: [userId], references: [id], onDelete: Cascade)
+  name               String
+  status             String            @default("draft") // draft | active | paused | stopped | completed
+  templateId         String?
+  template           EmailTemplate?    @relation(fields: [templateId], references: [id], onDelete: SetNull)
+  googleAccountId    String?
+  googleAccount      GoogleAccount?    @relation(fields: [googleAccountId], references: [id], onDelete: SetNull)
+  microsoftAccountId String?
+  smtpAccountId      String?
+  microsoftAccount   MicrosoftAccount? @relation(fields: [microsoftAccountId], references: [id], onDelete: SetNull)
+  smtpAccount        SmtpAccount?      @relation(fields: [smtpAccountId], references: [id], onDelete: SetNull)
+
+  recipients CampaignRecipient[]
+
+  // Optional audience segment. A stable group id is stored (never the name) so
+  // renaming a group never rewrites campaign history. SetNull: deleting a
+  // group must NOT delete or break its campaigns.
+  recipientGroupId String?
+  recipientGroup   Group?  @relation(fields: [recipientGroupId], references: [id], onDelete: SetNull)
+
+  createdAt    DateTime  @default(now())
+  updatedAt    DateTime  @updatedAt
+  startedAt    DateTime?
+  stoppedAt    DateTime?
+  completedAt  DateTime?
+  pausedAt     DateTime?
+  pausedReason String?
+
+  // Immutable copy of the template content taken when the campaign starts,
+  // so editing/deleting a template never changes already-sent message content.
+  templateSnapshot Json?
+
+  // Per-campaign sender display name (the "Leo" in "Leo <a@b.com>"). NULL means
+  // "fall back to the global SENDER_NAME env value", so every campaign created
+  // before this field existed keeps its previous behaviour untouched. This is a
+  // display name ONLY — the From ADDRESS always comes from the selected sending
+  // account, so this can never be used to spoof a different sender address.
+  senderName String?
+
+  @@index([userId])
+  @@index([status])
+}
+
+model CampaignRecipient {
+  id              String    @id @default(cuid())
+  campaignId      String
+  campaign        Campaign  @relation(fields: [campaignId], references: [id], onDelete: Cascade)
+  leadId          String?
+  lead            Lead?     @relation(fields: [leadId], references: [id], onDelete: SetNull)
+  recipient       String
+  subject         String?
+  status          String    @default("pending") // pending | sending | sent | failed | skipped
+  attempts        Int       @default(0)
+  lastError       String?
+  nextAttemptAt   DateTime?
+  sentAt          DateTime?
+  googleMessageId String?
+  isTest          Boolean   @default(false)
+  createdAt       DateTime  @default(now())
+  updatedAt       DateTime  @updatedAt
+
+  @@unique([campaignId, recipient])
+  @@index([campaignId])
+  @@index([status])
+  @@index([recipient])
+}
+
+model Suppression {
+  id        String   @id @default(cuid())
+  userId    String
+  user      User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  email     String
+  reason    String?
+  createdAt DateTime @default(now())
+
+  @@unique([userId, email])
+  @@index([userId])
+}
+
+// ---------------------------------------------------------------------------
+// SMS (8x8 Connect)
+// ---------------------------------------------------------------------------
+
+model SmsCampaign {
+  id          String    @id @default(cuid())
+  userId      String
+  user        User      @relation(fields: [userId], references: [id], onDelete: Cascade)
+  name        String
+  message     String
+  status      String    @default("draft") // draft | scheduled | sending | sent | failed
+  source      String    @default("8x8") // sending phone number / sender ID
+  x8BatchId   String?
+  createdAt   DateTime  @default(now())
+  updatedAt   DateTime  @updatedAt
+  scheduledAt DateTime?
+  completedAt DateTime?
+
+  messages Message[]
+  replies  Reply[]
+
+  @@index([userId])
+  @@index([status])
+}
+
+model Contact {
+  id          String   @id @default(cuid())
+  userId      String
+  user        User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  name        String
+  phoneNumber String
+  status      String   @default("active") // active | opted_out | invalid
+  optOut      Boolean  @default(false)
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+
+  messages Message[]
+  replies  Reply[]
+
+  @@unique([userId, phoneNumber])
+  @@index([userId])
+}
+
+model Message {
+  id          String       @id @default(cuid())
+  userId      String
+  user        User         @relation(fields: [userId], references: [id], onDelete: Cascade)
+  campaignId  String?
+  campaign    SmsCampaign? @relation(fields: [campaignId], references: [id], onDelete: SetNull)
+  contactId   String?
+  contact     Contact?     @relation(fields: [contactId], references: [id], onDelete: SetNull)
+  x8MessageId String?
+  phoneNumber String
+  message     String
+  direction   String       @default("outbound") // outbound | inbound
+  status      String       @default("queued") // queued | sent | delivered | undelivered | failed | rejected
+  source      String?
+  lastError   String?
+  sentAt      DateTime?
+  deliveredAt DateTime?
+  failedAt    DateTime?
+  createdAt   DateTime     @default(now())
+  updatedAt   DateTime     @updatedAt
+
+  replies       Reply[]
+  webhookEvents WebhookEvent[]
+
+  @@index([userId])
+  @@index([campaignId])
+  @@index([x8MessageId])
+  @@index([phoneNumber])
+  @@index([createdAt])
+}
+
+model Reply {
+  id          String       @id @default(cuid())
+  userId      String
+  user        User         @relation(fields: [userId], references: [id], onDelete: Cascade)
+  messageId   String?
+  thread      Message?     @relation(fields: [messageId], references: [id], onDelete: SetNull)
+  campaignId  String?
+  campaign    SmsCampaign? @relation(fields: [campaignId], references: [id], onDelete: SetNull)
+  contactId   String?
+  contact     Contact?     @relation(fields: [contactId], references: [id], onDelete: SetNull)
+  phoneNumber String
+  message     String
+  receivedAt  DateTime     @default(now())
+
+  @@index([userId])
+  @@index([phoneNumber])
+  @@index([receivedAt])
+}
+
+model WebhookEvent {
+  id          String   @id @default(cuid())
+  userId      String?
+  eventType   String
+  x8MessageId String?
+  payload     Json
+  processed   Boolean  @default(false)
+  error       String?
+  createdAt   DateTime @default(now())
+
+  messageId String?
+  message   Message? @relation(fields: [messageId], references: [id], onDelete: SetNull)
+
+  @@index([eventType])
+  @@index([x8MessageId])
+  @@index([processed])
+}
+
+model SmsTemplate {
+  id        String   @id @default(cuid())
+  userId    String
+  user      User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  name      String
+  message   String
+  isActive  Boolean  @default(true)
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([userId])
+}
+
+// ---------------------------------------------------------------------------
+// MAILBOX WARM-UP (added 2026-10-02)
+//
+// Warm-up is a CONTROLLED SENDING / RAMP / VERIFICATION mechanism. It is NOT a
+// deliverability guarantee and makes no promise about inbox placement or sender
+// reputation. It deliberately reuses the existing SmtpAccount model -- there is
+// no second mailbox or account system.
+//
+// It also does NOT feed campaign volume: finishing a warm-up ramp never raises a
+// campaign's send limit automatically.
+// ---------------------------------------------------------------------------
+
+/// Per-mailbox warm-up configuration. One row per SMTP mailbox that the
+/// operator has enrolled. Created from the global SendSettings defaults, then
+/// free to diverge so a global default change never retunes a live ramp.
+model WarmupMailboxSettings {
+  id            String      @id @default(cuid())
+  userId        String
+  user          User        @relation(fields: [userId], references: [id], onDelete: Cascade)
+  smtpAccountId String      @unique
+  smtpAccount   SmtpAccount @relation(fields: [smtpAccountId], references: [id], onDelete: Cascade)
+
+  enabled Boolean @default(false)
+
+  /// Day-1 volume, and the step size, and the hard cap for the ramp.
+  startingDailyVolume Int @default(5)
+  maximumDailyVolume  Int @default(15)
+  dailyIncrease       Int @default(1)
+
+  /// Spacing between warm-up sends, to avoid bursts. Seconds.
+  minimumDelaySeconds Int @default(60)
+  maximumDelaySeconds Int @default(120)
+
+  /// Local-time HH:mm window during which warm-up sends are allowed.
+  warmupWindowStart String @default("09:00")
+  warmupWindowEnd   String @default("17:00")
+
+  /// Pause the mailbox after maxConsecutiveFailures consecutive failures.
+  pauseOnError           Boolean @default(true)
+  maxConsecutiveFailures Int     @default(3)
+
+  // --- operational state ---
+  /// running | paused | paused_error | completed
+  status                    String  @default("paused")
+  /// Set when status is paused_error. Requires a manual resume after the fix.
+  statusMessage             String?
+  /// Consecutive days with at least one confirmed delivery. Resets on any
+  /// failed day. Display only -- never used to raise campaign volume.
+  consecutiveSuccessfulDays Int     @default(0)
+  consecutiveFailures       Int     @default(0)
+
+  /// Day number of the ramp. 1 = the first day warm-up has actually run.
+  currentDay     Int       @default(0)
+  /// Last day a warm-up send actually happened, YYYY-MM-DD (UTC).
+  lastActiveDate String?
+  lastSendAt     DateTime?
+  /// When the operator may next start/enable this mailbox.
+  startedAt      DateTime?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  jobs  WarmupJob[]
+  usage WarmupDailyUsage[]
+
+  @@index([userId, status])
+  @@index([status])
+}
+
+/// One warm-up message attempt. Separate from CampaignRecipient on purpose:
+/// warm-up never touches the campaign queue and campaign sends never touch this.
+model WarmupJob {
+  id        String                @id @default(cuid())
+  userId    String
+  user      User                  @relation(fields: [userId], references: [id], onDelete: Cascade)
+  mailboxId String
+  mailbox   WarmupMailboxSettings @relation(fields: [mailboxId], references: [id], onDelete: Cascade)
+
+  /// The mailbox that SENT this message.
+  senderSmtpAccountId   String
+  senderSmtpAccount     SmtpAccount @relation("WarmupSender", fields: [senderSmtpAccountId], references: [id], onDelete: Cascade)
+  /// The mailbox that should RECEIVE it (chosen by rotation). Always an
+  /// enrolled pool mailbox -- never an external prospect.
+  receiverSmtpAccountId String
+  receiverSmtpAccount   SmtpAccount @relation("WarmupReceiver", fields: [receiverSmtpAccountId], references: [id], onDelete: Cascade)
+
+  /// Our own RFC 5322 Message-ID, also written to a X-Warmup-Job header so the
+  /// IMAP poller can match an incoming message back to this exact job.
+  messageId String @unique
+  subject   String
+  /// queued | sending | sent | delivered | failed | unconfirmed | cancelled
+  status    String @default("queued")
+
+  scheduledFor   DateTime
+  claimedAt      DateTime?
+  /// Lease expiry: a crashed worker's job is reclaimable after this.
+  leaseExpiresAt DateTime?
+  attempts       Int       @default(0)
+
+  sentAt            DateTime?
+  /// Set ONLY after IMAP actually found the message. An SMTP acceptance alone
+  /// never sets this.
+  deliveredAt       DateTime?
+  /// Milliseconds between SMTP accept and IMAP observation.
+  deliveryLatencyMs Int?
+  /// Mailbox-observed identifier, recorded for auditability only.
+  receiverMessageId String?
+
+  lastError      String?
+  failureKind    String? // temporary | auth | permanent | imap
+  permanentError Boolean @default(false)
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  events WarmupEvent[]
+
+  @@unique([mailboxId, scheduledFor])
+  @@index([status, scheduledFor])
+  @@index([mailboxId, status])
+  @@index([userId, createdAt])
+}
+
+/// Append-only audit trail of everything that happened to a warm-up job:
+/// scheduled, claimed, sent, SMTP-failed, IMAP-confirmed, IMAP-failed.
+model WarmupEvent {
+  id    String     @id @default(cuid())
+  jobId String?
+  job   WarmupJob? @relation(fields: [jobId], references: [id], onDelete: Cascade)
+
+  mailboxId String
+  userId    String
+  /// scheduled | claimed | sent | delivered | smtp_failed | imap_failed
+  /// | imap_unconfirmed | paused | resumed | reset | skipped
+  type      String
+  message   String?
+  /// Extra structured detail. Never contains credentials or message bodies.
+  meta      Json?
+  createdAt DateTime @default(now())
+  User      User     @relation(fields: [userId], references: [id])
+
+  @@index([mailboxId, createdAt])
+  @@index([userId, createdAt])
+  @@index([type])
+}
+
+/// Per-mailbox, per-day warm-up bookkeeping (ramp day, warm-up send count,
+/// target).
+///
+/// IMPORTANT: this table is NOT the sending ceiling. The absolute per-mailbox
+/// daily ceiling is the existing DailySendCounter, which counts campaign AND
+/// warm-up sends against one shared budget. If this table also tracked the
+/// ceiling, the two could disagree and the shared limit would be fiction.
+/// warmupSent here is a per-day breakdown for charts only.
+model WarmupDailyUsage {
+  id        String                @id @default(cuid())
+  mailboxId String
+  mailbox   WarmupMailboxSettings @relation(fields: [mailboxId], references: [id], onDelete: Cascade)
+  userId    String
+  date      String // YYYY-MM-DD (UTC)
+
+  warmupSent   Int @default(0)
+  warmupFailed Int @default(0)
+  delivered    Int @default(0)
+  /// The ramp target that applied on this day (starting + increase * (day-1)).
+  target       Int @default(0)
+  /// Ramps to a new day only after a day with activity, so a paused mailbox
+  /// does not jump 3 days forward on resume.
+  rampDay      Int @default(0)
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+  User      User     @relation(fields: [userId], references: [id])
+
+  @@unique([mailboxId, date])
+  @@index([userId, date])
+}

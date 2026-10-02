@@ -1,0 +1,62 @@
+# dependencies
+/node_modules
+
+# next.js
+/.next/
+/out/
+
+# production
+/build
+
+# misc
+.DS_Store
+*.pem
+
+# debug
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+
+# local env files
+.env
+.env*.local
+
+# embedded postgres data dir (local database — never commit)
+/.pgdata/
+
+# runtime logs + pid files
+*.log
+*.log.*
+db.log*
+*.pid
+
+# typescript
+*.tsbuildinfo
+
+# prisma
+# generated client is usually committed, but keep db files out
+/prisma/*.db
+# ---------------------------------------------------------------------------
+# Secrets that the rules above did not catch. Added at the first git commit.
+# These were all present on disk and would otherwise have been committed with
+# LIVE credentials, which cannot be undone by amending the commit.
+# ---------------------------------------------------------------------------
+
+# Every .env variant EXCEPT the template. The existing rule only covered
+# .env and .env*.local, so five dated backups of the real file
+# (.env.bak-*, .env.backup-*) were about to be tracked.
+/.env.*
+!/.env.example
+
+# Admin login and Cloudflare tunnel token, both local-only.
+/.admin-credentials.txt
+/TUNNEL-URL.txt
+
+# Local snapshots and data exports: OAuth status payloads and a contacts
+# export, which can carry tokens and personal data.
+/.snapshots/
+/backups/
+
+# Zero-byte artefacts from a shell redirect that was missing its target file.
+/newestGoogle.updatedAt.getTime())/
+/newestMicrosoft.updatedAt.getTime())/

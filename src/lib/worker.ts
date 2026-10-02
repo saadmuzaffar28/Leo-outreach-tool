@@ -1,0 +1,549 @@
+import { prisma } from "@/lib/prisma";
+import { env, POLL_INTERVAL_MS } from "@/lib/env";
+import {
+  decryptAccount,
+  getAuthorizedOAuthClient,
+  mergeStoredTokens,
+  sendMessage,
+  type DecryptedAccount,
+  type GmailOAuthClient,
+} from "@/lib/google";
+import {
+  decryptMicrosoftAccount,
+  encryptMicrosoftTokens,
+  getAuthorizedMicrosoft,
+  sendMicrosoftMail,
+  GRAPH_SENT_MARKER,
+  type DecryptedMicrosoftAccount,
+} from "@/lib/microsoft";
+import type { MailMessage } from "@/lib/message";
+import { buildRawMessage, htmlBody, plainBody, plainTextToHtml } from "@/lib/message";
+import { decryptSmtpCredentials, sendSmtpMail, type SmtpSecurity } from "@/lib/smtp";
+import { buildUnsubscribeUrl, isSuppressed } from "@/lib/suppression";
+import { personalize } from "@/lib/personalization";
+import { fillSubject } from "@/lib/campaigns";
+import { campaignTemplateSource } from "@/lib/templates";
+import { decideSendError, type RetryPolicy } from "@/lib/send-queue";
+import {
+  clearRateLimitState,
+  getDailyCounter,
+  incrementDailyCounter,
+  isQuotaPaused,
+  recordRateLimitHit,
+  type SendProvider,
+} from "@/lib/quota";
+import { getSendSettings, type SendSettingsData } from "@/lib/settings";
+import { SendRateLimiter, type SendRatePolicy } from "@/lib/rate-limiter";
+
+let shuttingDown = false;
+
+/** Lease length for an atomic recipient claim — covers a crashed worker. */
+const CLAIM_LEASE_MS = 10 * 60 * 1000;
+
+const limiter = new SendRateLimiter();
+
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+function retryPolicy(settings: SendSettingsData): RetryPolicy {
+  return {
+    maxRetryAttempts: settings.maxRetryAttempts,
+    baseRetryDelaySeconds: settings.baseRetryDelaySeconds,
+    maxRetryDelaySeconds: settings.maxRetryDelaySeconds,
+  };
+}
+
+function ratePolicy(settings: SendSettingsData): SendRatePolicy {
+  return {
+    messagesPerMinute: settings.messagesPerMinute,
+    minDelaySeconds: settings.minDelaySeconds,
+  };
+}
+
+async function markRecipient(
+  id: string,
+  data: {
+    status: string;
+    lastError?: string | null;
+    nextAttemptAt?: Date | null;
+    sentAt?: Date;
+    googleMessageId?: string;
+    subject?: string;
+    isTest?: boolean;
+    attempts?: number;
+  },
+): Promise<void> {
+  await prisma.campaignRecipient.update({ where: { id }, data });
+}
+
+/**
+ * Atomically claims a recipient so only one worker send is possible.
+ * Fails for rows already claimed by another worker (status "sending",
+ * not yet past its lease) or already terminal.
+ */
+async function claimRecipient(id: string, attempts: number, now: Date): Promise<boolean> {
+  const res = await prisma.campaignRecipient.updateMany({
+    where: {
+      id,
+      OR: [{ status: "pending" }, { status: "sending", nextAttemptAt: { lte: now } }],
+    },
+    data: {
+      status: "sending",
+      attempts: attempts + 1,
+      nextAttemptAt: new Date(now.getTime() + CLAIM_LEASE_MS),
+    },
+  });
+  return res.count === 1;
+}
+
+async function pauseCampaignsOnAccount(provider: SendProvider, accountId: string, reason: string): Promise<void> {
+  const field =
+    provider === "smtp" ? "smtpAccountId"
+      : provider === "microsoft" ? "microsoftAccountId"
+        : "googleAccountId";
+  await prisma.campaign.updateMany({
+    where: { [field]: accountId, status: "active" },
+    data: { status: "paused", pausedAt: new Date(), pausedReason: reason },
+  });
+}
+
+interface SendAccount {
+  id: string;
+  quotaPausedUntil: Date | null;
+  signatureOverride: string | null;
+}
+
+export async function processDueRecipients(): Promise<number> {
+  const now = new Date();
+  const due = await prisma.campaignRecipient.findMany({
+    where: {
+      campaign: { status: "active" },
+      OR: [{ status: "pending" }, { status: "sending", nextAttemptAt: { lte: now } }],
+    },
+    include: {
+      campaign: { include: { googleAccount: true, microsoftAccount: true, smtpAccount: true, template: true } },
+      lead: true,
+    },
+    orderBy: { createdAt: "asc" },
+    take: 10,
+  });
+  if (due.length === 0) return 0;
+
+  // Settings + suppression lists are per-owner; cache within this tick.
+  const settingsCache = new Map<string, SendSettingsData>();
+  const suppressionCache = new Map<string, ReadonlySet<string>>();
+  const runningSent = new Map<string, number>();
+  const runningLimits = new Map<string, number>();
+  const runningProviders = new Map<string, SendProvider>();
+
+  async function settingsFor(userId: string): Promise<SendSettingsData> {
+    let s = settingsCache.get(userId);
+    if (!s) {
+      s = await getSendSettings(userId);
+      settingsCache.set(userId, s);
+    }
+    return s;
+  }
+
+  async function suppressedFor(userId: string): Promise<ReadonlySet<string>> {
+    let set = suppressionCache.get(userId);
+    if (set === undefined) {
+      const rows = await prisma.suppression.findMany({
+        where: { userId },
+        select: { email: true },
+      });
+      set = new Set(rows.map((r) => r.email.toLowerCase()));
+      suppressionCache.set(userId, set);
+    }
+    return set;
+  }
+
+  async function todaySentFor(provider: SendProvider, accountId: string, userId: string): Promise<number> {
+    let sent = runningSent.get(accountId);
+    if (sent === undefined) {
+      const c = await getDailyCounter(provider, accountId, userId);
+      sent = c.messagesSent;
+      runningSent.set(accountId, sent);
+    }
+    return sent;
+  }
+
+  let processed = 0;
+
+  for (const rec of due) {
+    const smtpAccount = rec.campaign.smtpAccount;
+    const googleAccount = rec.campaign.googleAccount;
+    const microsoftAccount = rec.campaign.microsoftAccount;
+    const provider: SendProvider = smtpAccount ? "smtp" : microsoftAccount ? "microsoft" : "google";
+    const rawAccount = smtpAccount ?? microsoftAccount ?? googleAccount;
+    if (!rawAccount) {
+      await markRecipient(rec.id, { status: "failed", lastError: "No sending account connected to this campaign" });
+      processed++;
+      continue;
+    }
+    const account: SendAccount = {
+      id: rawAccount.id,
+      quotaPausedUntil:
+        provider === "smtp"
+          ? null
+          : (rawAccount as { quotaPausedUntil: Date | null }).quotaPausedUntil,
+      signatureOverride:
+        provider === "smtp"
+          ? null
+          : (rawAccount as { signatureOverride: string | null }).signatureOverride,
+    };
+    const settings = await settingsFor(rec.campaign.userId);
+
+    // Account-level rate-limit backoff (persisted across restarts).
+    if (isQuotaPaused(account.quotaPausedUntil)) {
+      continue;
+    }
+
+    // Per-account rate limiter: messages/min + minimum delay.
+    const policy = ratePolicy(settings);
+    if (!limiter.canSend(account.id, policy)) {
+      continue;
+    }
+
+    // Daily application limit, enforced against the persistent counter.
+    const sentToday = await todaySentFor(provider, account.id, rec.campaign.userId);
+    const dailyLimit = settings.dailySendLimit;
+    runningLimits.set(account.id, dailyLimit);
+    runningProviders.set(account.id, provider);
+    if (sentToday >= dailyLimit) {
+      await pauseCampaignsOnAccount(
+        provider,
+        account.id,
+        `Daily application send limit reached (${sentToday}/${dailyLimit}). Resume after the daily window resets.`,
+      );
+      continue;
+    }
+
+    // Suppression list is checked immediately before every send attempt.
+    const suppressed = await suppressedFor(rec.campaign.userId);
+    if (isSuppressed(rec.recipient, suppressed)) {
+      await markRecipient(rec.id, { status: "skipped", lastError: "Suppressed" });
+      await incrementDailyCounter(provider, account.id, rec.campaign.userId, { kind: "skipped", count: 1 });
+      processed++;
+      continue;
+    }
+
+    const tpl = campaignTemplateSource(rec.campaign);
+    if (!tpl) {
+      await markRecipient(rec.id, { status: "failed", lastError: "Email template missing" });
+      processed++;
+      continue;
+    }
+
+    // Atomic claim — prevents duplicate sends if two workers race, and lets
+    // a crashed worker's claim be reclaimed after the lease expires.
+    if (!(await claimRecipient(rec.id, rec.attempts, now))) {
+      continue;
+    }
+    const attemptsUsed = rec.attempts + 1;
+
+    const googleAccountData = provider === "google" ? decryptAccount(googleAccount!) : null;
+    const microsoftAccountData = provider === "microsoft" ? decryptMicrosoftAccount(microsoftAccount!) : null;
+    const values = {
+      first_name: rec.lead?.firstName ?? "",
+      last_name: rec.lead?.lastName ?? "",
+      email: rec.recipient,
+      practice_name: rec.lead?.practiceName ?? "",
+    };
+    const subject = fillSubject(tpl.subject, values);
+    const body = personalize(tpl.body, values);
+
+    // Signature: template override wins, then the account's custom override,
+    // then the signature captured from the connected account (Gmail only).
+    let signatureHtml: string | null = null;
+    if (tpl.useSignature) {
+      signatureHtml = tpl.signatureOverride
+        ? plainTextToHtml(tpl.signatureOverride)
+        : account.signatureOverride
+          ? plainTextToHtml(account.signatureOverride)
+          : googleAccountData?.signature ?? null;
+    }
+
+    const fromEmail =
+      provider === "smtp"
+        ? smtpAccount!.email
+        : provider === "microsoft"
+          ? microsoftAccountData!.microsoftEmail
+          : googleAccountData!.googleEmail;
+
+    // Per-campaign display name, falling back to the global SENDER_NAME when the
+    // campaign has none (all campaigns created before this field existed). The
+    // From ADDRESS is still derived from the selected sending account above, so a
+    // custom display name can never spoof a different sender address.
+    const fromName = rec.campaign.senderName?.trim() || env.SENDER_NAME;
+
+    const message: MailMessage = {
+      fromName,
+      fromEmail,
+      to: rec.recipient,
+      subject,
+      body,
+      unsubscribeUrl: buildUnsubscribeUrl(rec.campaign.userId, rec.recipient),
+      signatureHtml,
+    };
+
+    // Test mode: process the queue exactly like live, but never call the provider.
+    if (settings.sendMode === "test") {
+      const decoded = Buffer.from(buildRawMessage(message), "base64url").toString("utf8");
+      console.log(
+        `[test] simulated send to ${rec.recipient} — subject "${subject}"\n${decoded}`,
+      );
+      await markRecipient(rec.id, {
+        status: "sent",
+        subject,
+        sentAt: new Date(),
+        googleMessageId: "simulated",
+        lastError: null,
+        nextAttemptAt: null,
+        isTest: true,
+      });
+      limiter.recordSend(account.id);
+      runningSent.set(account.id, (runningSent.get(account.id) ?? sentToday) + 1);
+      await incrementDailyCounter(provider, account.id, rec.campaign.userId, { kind: "sent", count: 1 });
+      processed++;
+      continue;
+    }
+
+    let oauth: GmailOAuthClient | null = null;
+    let microsoftAccessToken: string | null = null;
+    // SMTP authenticates with its own stored username/password — no OAuth step.
+    if (provider !== "smtp") {
+      try {
+        if (provider === "microsoft") {
+          const { accessToken, refreshedTokens } = await getAuthorizedMicrosoft(microsoftAccountData!);
+          microsoftAccessToken = accessToken;
+          if (refreshedTokens) {
+            await prisma.microsoftAccount.update({
+              where: { id: account.id },
+              data: encryptMicrosoftTokens(refreshedTokens),
+            });
+          }
+        } else {
+          const { client, refreshedTokens } = await getAuthorizedOAuthClient(googleAccountData!);
+          oauth = client;
+          if (refreshedTokens) {
+            await prisma.googleAccount.update({
+              where: { id: account.id },
+              data: {
+                // Google's token endpoint returns no refresh_token on refresh,
+                // so this must be merged, never overwritten -- otherwise the
+                // first send after expiry would erase the offline grant and the
+                // account could never refresh again.
+                ...mergeStoredTokens(refreshedTokens, {
+                  refreshTokenEncrypted: googleAccount!.refreshTokenEncrypted,
+                }),
+                // A successful refresh proves the grant still works.
+                status: "connected",
+                statusMessage: null,
+              },
+            });
+          }
+        }
+      } catch (err) {
+        await handleError(provider, rec.id, account.id, rec.campaign.userId, err, attemptsUsed, settings);
+        processed++;
+        continue;
+      }
+    }
+
+    try {
+      if (provider === "microsoft") {
+        // For "shared" connect-mode accounts the stored sendFromEmail is passed
+        // as a message-level FROM override (delegated Mail.Send.Shared). It is
+        // purely a send-side override and is NEVER used to authenticate.
+        const sendFromEmail = microsoftAccount?.sendFromEmail?.trim() || undefined;
+        await sendMicrosoftMail(microsoftAccessToken!, message, sendFromEmail ? { sendFromEmail } : undefined);
+        await markRecipient(rec.id, {
+          status: "sent",
+          subject,
+          sentAt: new Date(),
+          googleMessageId: GRAPH_SENT_MARKER,
+          lastError: null,
+          nextAttemptAt: null,
+        });
+      } else if (provider === "smtp") {
+        // Decrypt the SMTP credentials in memory, immediately before sending.
+        // The password is never stored on the message, never logged, and never
+        // returned by any API.
+        const dec = decryptSmtpCredentials({
+          usernameEncrypted: smtpAccount!.usernameEncrypted,
+          passwordEncrypted: smtpAccount!.passwordEncrypted,
+        });
+        await sendSmtpMail(
+          {
+            email: smtpAccount!.email,
+            host: smtpAccount!.host,
+            port: smtpAccount!.port,
+            security: smtpAccount!.security as SmtpSecurity,
+            username: dec.username,
+            password: dec.password,
+          },
+          { to: message.to, subject, html: htmlBody(message), text: plainBody(message) },
+        );
+        await markRecipient(rec.id, {
+          status: "sent",
+          subject,
+          sentAt: new Date(),
+          lastError: null,
+          nextAttemptAt: null,
+        });
+      } else {
+        const { messageId } = await sendMessage(oauth!, message);
+        await markRecipient(rec.id, {
+          status: "sent",
+          subject,
+          sentAt: new Date(),
+          googleMessageId: messageId,
+          lastError: null,
+          nextAttemptAt: null,
+        });
+      }
+      await Promise.all([
+        clearRateLimitState(provider, account.id),
+        incrementDailyCounter(provider, account.id, rec.campaign.userId, { kind: "sent", count: 1 }),
+      ]);
+      limiter.recordSend(account.id);
+      runningSent.set(account.id, (runningSent.get(account.id) ?? sentToday) + 1);
+      processed++;
+    } catch (err) {
+      await handleError(provider, rec.id, account.id, rec.campaign.userId, err, attemptsUsed, settings);
+      processed++;
+    }
+  }
+
+  // Budget overflow cleanup — if any account crossed/equaled its limit this
+  // tick, pause its active campaigns so remaining sends stop.
+  for (const [accountId, limit] of Array.from(runningLimits.entries())) {
+    const sent = runningSent.get(accountId) ?? 0;
+    if (sent >= limit) {
+      await pauseCampaignsOnAccount(
+        runningProviders.get(accountId) ?? "google",
+        accountId,
+        `Daily application send limit reached (${sent}/${limit}). Resume after the daily window resets.`,
+      );
+    }
+  }
+
+  return processed;
+}
+
+async function handleError(
+  provider: SendProvider,
+  recipientId: string,
+  accountId: string,
+  userId: string,
+  err: unknown,
+  attemptsUsed: number,
+  settings: SendSettingsData,
+): Promise<void> {
+  const decision = decideSendError(err, attemptsUsed, retryPolicy(settings));
+
+  if (decision.action === "auth_required") {
+    await markRecipient(recipientId, { status: "failed", lastError: decision.message, nextAttemptAt: null });
+    const field =
+      provider === "smtp" ? "smtpAccountId"
+        : provider === "microsoft" ? "microsoftAccountId"
+          : "googleAccountId";
+    // Flag ONLY this account as needing reauthorization, so one revoked grant
+    // does not put every other connected Gmail account into the same state.
+    if (provider === "google") {
+      await prisma.googleAccount.updateMany({
+        where: { id: accountId, status: { not: "reauth_required" } },
+        data: { status: "reauth_required", statusMessage: decision.message },
+      });
+    }
+    await prisma.campaign.updateMany({
+      where: { [field]: accountId, status: "active" },
+      data: {
+        status: "paused",
+        pausedAt: new Date(),
+        pausedReason: `${decision.message}. Reconnect the sending account, then resume the campaign.`,
+      },
+    });
+    await incrementDailyCounter(provider, accountId, userId, { kind: "failed", count: 1 });
+    // Account id + reason only -- never a token.
+    console.warn(`[worker] auth required for account ${accountId}: ${decision.message}`);
+    return;
+  }
+
+  if (decision.action === "quota_backoff") {
+    const pausedMs = await recordRateLimitHit(provider, accountId, decision.retryAfterSeconds, decision.message);
+    await markRecipient(recipientId, {
+      status: "sending",
+      attempts: attemptsUsed,
+      lastError: decision.message,
+      nextAttemptAt: new Date(Date.now() + Math.max(decision.retryAfterSeconds * 1000, pausedMs)),
+    });
+    console.warn(
+      `[worker] rate limit on ${accountId} — backoff ${decision.retryAfterSeconds}s${pausedMs > 0 ? `, account paused until ${new Date(Date.now() + pausedMs).toISOString()}` : ""}`,
+    );
+    return;
+  }
+
+  // schedule_retry or fail_permanent
+  const failed = decision.action === "fail_permanent";
+  await markRecipient(recipientId, {
+    status: failed ? "failed" : "sending",
+    attempts: attemptsUsed,
+    lastError: decision.message,
+    nextAttemptAt: failed ? null : new Date(Date.now() + decision.retryAfterSeconds * 1000),
+  });
+  if (failed) {
+    await incrementDailyCounter(provider, accountId, userId, { kind: "failed", count: 1 });
+  }
+}
+
+/** Marks campaigns completed when every recipient is terminal. */
+export async function markCompletedCampaigns(): Promise<string[]> {
+  const active = await prisma.campaign.findMany({
+    where: { status: "active" },
+    select: { id: true },
+  });
+  const completed: string[] = [];
+  for (const campaign of active) {
+    const remaining = await prisma.campaignRecipient.count({
+      where: { campaignId: campaign.id, status: { in: ["pending", "sending"] } },
+    });
+    if (remaining === 0) {
+      await prisma.campaign.update({
+        where: { id: campaign.id },
+        data: { status: "completed", completedAt: new Date() },
+      });
+      completed.push(campaign.id);
+    }
+  }
+  return completed;
+}
+
+export async function runWorker(): Promise<void> {
+  console.log("[worker] starting — polling every %ds", env.POLL_INTERVAL_SECONDS);
+
+  process.on("SIGINT", () => {
+    shuttingDown = true;
+    console.log("[worker] stopping…");
+    setTimeout(() => process.exit(0), 500).unref();
+  });
+  process.on("SIGTERM", () => {
+    shuttingDown = true;
+    console.log("[worker] stopping…");
+    setTimeout(() => process.exit(0), 500).unref();
+  });
+
+  while (!shuttingDown) {
+    try {
+      const processed = await processDueRecipients();
+      const completed = await markCompletedCampaigns();
+      if (processed > 0) console.log(`[worker] processed ${processed} recipient(s)`);
+      for (const id of completed) console.log(`[worker] campaign ${id} completed`);
+    } catch (err) {
+      console.error("[worker] tick failed", err);
+    }
+    await sleep(POLL_INTERVAL_MS);
+  }
+}
