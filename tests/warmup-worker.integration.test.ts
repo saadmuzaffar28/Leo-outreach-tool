@@ -37,6 +37,7 @@ vi.mock("@/lib/warmup/imap", async (importOriginal) => {
 // ---------------------------------------------------------------------------
 
 import { createUser, createSmtpAccount, enrollMailbox, setDailyLimit } from "./helpers/fixtures";
+import { eligibleReceivers, pickReceiverPreferCrossDomain } from "@/lib/warmup/pool";
 import type { PrismaClient } from "@prisma/client";
 
 let prisma: PrismaClient;
@@ -787,52 +788,259 @@ describe("warm-up lifecycle controls", () => {
     expect(sendSmtpMail).not.toHaveBeenCalled();
   });
 
-  it("first mailbox can be enrolled when zero partners exist", async () => {
-    // The first mailbox may be enrolled even when zero other mailboxes exist.
-    // Sending is gated by the worker's receiver-pool validation (pickReceiverPreferCrossDomain
-    // returns null when pool < 2), so no warm-up job is created with a lone mailbox.
-    const a = await createSmtpAccount(prisma, userId);
-    const res = await service.startWarmup(userId, a.id);
-    // First mailbox enrollment succeeds even with no partner
-    expect(res.ok).toBe(true);
-    // Mailbox is enabled and running
-    const settings = await prisma.warmupMailboxSettings.findUniqueOrThrow({ where: { smtpAccountId: a.id } });
-    expect(settings.enabled).toBe(true);
-    expect(settings.status).toBe("running");
-  });
+  // =========================================================================
+  // Enrollment deadlock regression coverage (A-H).
+  //
+  // Enrollment and SENDING are deliberately separate conditions:
+  //   enrollment -> the operator may enrol the FIRST mailbox with no partner
+  //   sending    -> needs a valid receiver, so it needs a SECOND mailbox
+  //
+  // Every assertion below runs the real service/worker path against the real
+  // Postgres. No assertion here can pass vacuously: job counts are compared to
+  // exact values, and every "must not happen" claim is checked by inspecting
+  // the rows that were actually written.
+  // =========================================================================
+  describe("enrollment deadlock regression (A-H)", () => {
+    it("A: the first mailbox can be enrolled when zero mailboxes are enrolled", async () => {
+      // Precondition, asserted rather than assumed: the pool really is empty.
+      expect(await service.loadPool(userId)).toHaveLength(0);
 
-  it("no warm-up send when only one mailbox enrolled", async () => {
-    // When only one mailbox is enrolled, no valid receiver exists,
-    // so no warm-up job is scheduled/sent. The worker's pool validation
-    // prevents self-delivery and external recipients.
-    const a = await createSmtpAccount(prisma, userId);
-    // First enroll the first mailbox
-    await service.startWarmup(userId, a.id);
-    // Now try to enroll a second mailbox (b)
-    const b = await createSmtpAccount(prisma, userId);
-    await service.startWarmup(userId, b.id);
-    // At this point, two mailboxes are enrolled but no send should have occurred
-    // because there's no valid receiver yet (pool size = 2, but need to check)
-    const settingsA = (await prisma.warmupMailboxSettings.findUnique({
-      where: { smtpAccountId: a.id },
-      select: { enabled: true, status: true, startingDailyVolume: true }
-    }))!
-    const settingsB = (await prisma.warmupMailboxSettings.findUnique({
-      where: { smtpAccountId: b.id },
-      select: { enabled: true, status: true, startingDailyVolume: true }
-    }))!
-    // Both mailboxes should be enabled (enrollment succeeded)
-    expect(settingsA.enabled).toBe(true);
-    expect(settingsB.enabled).toBe(true);
-    // Verify no warm-up jobs were created with invalid receivers
-    const jobs = await prisma.warmupJob.findMany({
-      where: { userId },
-      take: 10,
-      orderBy: { scheduledFor: "asc" }
+      const a = await createSmtpAccount(prisma, userId, { email: `first-${Date.now()}@test.example` });
+      const res = await service.startWarmup(userId, a.id);
+
+      expect(res.ok).toBe(true);
+      expect(res.status).toBe("running");
+      expect(res.message).not.toMatch(/at least one other/i);
+
+      // Persisted state, read back from the database.
+      const s = await prisma.warmupMailboxSettings.findUniqueOrThrow({
+        where: { smtpAccountId: a.id },
+      });
+      expect(s.enabled).toBe(true);
+      expect(s.status).toBe("running");
+      expect(s.statusMessage).toBeNull();
+
+      // It really is in the pool afterwards.
+      expect((await service.loadPool(userId)).map((m) => m.id)).toEqual([a.id]);
     });
-    // Since only 2 mailboxes are enrolled and no cross-mailbox send has been scheduled,
-    // jobs count should reflect the enrollment state
-    expect(jobs.length).toBeGreaterThanOrEqual(0);
+
+    it("B: with exactly ONE enrolled mailbox no warm-up send is created", async () => {
+      const a = await createSmtpAccount(prisma, userId, { email: `solo-${Date.now()}@test.example` });
+      const ma = await enrollMailbox(prisma, userId, a.id, {
+        enabled: true,
+        status: "running",
+        startingDailyVolume: 50,
+        maximumDailyVolume: 50,
+        minimumDelaySeconds: 5,
+        maximumDelaySeconds: 5,
+        warmupWindowStart: "00:00",
+        warmupWindowEnd: "23:59",
+      });
+
+      // Precondition: exactly one enrolled mailbox, and it is running.
+      expect(await service.loadPool(userId)).toHaveLength(1);
+      const pre = await prisma.warmupMailboxSettings.findUniqueOrThrow({ where: { id: ma.id } });
+      expect(pre.enabled).toBe(true);
+      expect(pre.status).toBe("running");
+
+      // Drive the REAL planning path.
+      const plan = await service.planNextSend({ userId, mailboxSettingsId: ma.id });
+
+      expect(plan.action).toBe("stop");
+      expect(plan.reason).toMatch(/no other enrolled warm-up mailbox/i);
+      expect(plan.job).toBeUndefined();
+
+      // Exact count, not a tautology: no job row exists.
+      expect(await prisma.warmupJob.count()).toBe(0);
+
+      // And the worker tick must not send either.
+      await worker.warmupTick();
+      expect(sendSmtpMail).not.toHaveBeenCalled();
+      expect(await prisma.warmupJob.count()).toBe(0);
+    });
+
+    it("C: with TWO enrolled mailboxes a valid cross-mailbox job is planned", async () => {
+      const { a, b, ma } = await pair();
+      expect(await service.loadPool(userId)).toHaveLength(2);
+
+      const plan = await service.planNextSend({ userId, mailboxSettingsId: ma.id });
+
+      expect(plan.action).toBe("schedule");
+      expect(plan.job).toBeDefined();
+      expect(plan.job!.receiverEmail).toBe(b.email);
+
+      // The FK columns live on the persisted row, not on the plan's summary.
+      const job = await prisma.warmupJob.findUniqueOrThrow({ where: { id: plan.job!.id } });
+      expect(job.senderSmtpAccountId).toBe(a.id);
+      expect(job.receiverSmtpAccountId).toBe(b.id);
+
+      // The two ends must differ.
+      expect(job.senderSmtpAccountId).not.toBe(job.receiverSmtpAccountId);
+
+      // Persisted exactly one job, between two distinct mailboxes.
+      const rows = await prisma.warmupJob.findMany();
+      expect(rows).toHaveLength(1);
+      expect(rows[0].senderSmtpAccountId).not.toBe(rows[0].receiverSmtpAccountId);
+    });
+
+    it("D: the sender can never select itself as the receiver", async () => {
+      // Pure-function level: a one-member pool yields no receiver at all.
+      const solo = { id: "solo-1", email: "solo@test.example" };
+      expect(pickReceiverPreferCrossDomain([solo], solo, 0)).toBeNull();
+      expect(eligibleReceivers([solo], solo)).toHaveLength(0);
+
+      // Service level: sweep the rotation cursor so no offset can slip through.
+      const { a, ma } = await pair();
+      for (const cursor of [0, 1, 2, 3, 4, 5]) {
+        const plan = await service.planNextSend({ userId, mailboxSettingsId: ma.id, cursor });
+        expect(plan.action).toBe("schedule");
+        expect(plan.job!.receiverEmail).not.toBe(a.email);
+        const job = await prisma.warmupJob.findUniqueOrThrow({ where: { id: plan.job!.id } });
+        expect(job.receiverSmtpAccountId).not.toBe(a.id);
+      }
+
+      // No self-directed job exists in the table, whatever was planned.
+      const rows = await prisma.warmupJob.findMany();
+      expect(rows.length).toBeGreaterThan(0);
+      for (const r of rows) {
+        expect(r.senderSmtpAccountId).not.toBe(r.receiverSmtpAccountId);
+      }
+    });
+
+    it("E: a non-enrolled external address can never become a warm-up receiver", async () => {
+      const { ma } = await pair();
+
+      // An SMTP account that exists but was never enrolled in warm-up.
+      const outsider = await createSmtpAccount(prisma, userId, {
+        email: `outsider-${Date.now()}@elsewhere.example`,
+      });
+      // A mailbox belonging to a different user.
+      const stranger = await createSmtpAccount(prisma, otherUserId, {
+        email: `stranger-${Date.now()}@elsewhere.example`,
+      });
+
+      const pool = await service.loadPool(userId);
+      expect(pool).toHaveLength(2);
+      expect(pool.map((m) => m.id)).not.toContain(outsider.id);
+      expect(pool.map((m) => m.id)).not.toContain(stranger.id);
+
+      for (const cursor of [0, 1, 2, 3]) {
+        const plan = await service.planNextSend({ userId, mailboxSettingsId: ma.id, cursor });
+        expect(plan.action).toBe("schedule");
+
+        const job = await prisma.warmupJob.findUniqueOrThrow({ where: { id: plan.job!.id } });
+        const receiverId = job.receiverSmtpAccountId;
+        expect(receiverId).not.toBe(outsider.id);
+        expect(receiverId).not.toBe(stranger.id);
+
+        // The receiver resolves to a real SmtpAccount owned by this user...
+        const acct = await prisma.smtpAccount.findUniqueOrThrow({ where: { id: receiverId } });
+        expect(acct.userId).toBe(userId);
+        expect(acct.email).not.toMatch(/elsewhere\.example/);
+
+        // ...and that account is an ENABLED, enrolled warm-up mailbox.
+        const rec = await prisma.warmupMailboxSettings.findUniqueOrThrow({
+          where: { smtpAccountId: receiverId },
+        });
+        expect(rec.enabled).toBe(true);
+      }
+
+      // Every receiver that actually landed in the table is an enrolled mailbox.
+      const rows = await prisma.warmupJob.findMany();
+      expect(rows.length).toBeGreaterThan(0);
+      const enrolled = new Set((await service.loadPool(userId)).map((m) => m.id));
+      for (const r of rows) expect(enrolled.has(r.receiverSmtpAccountId)).toBe(true);
+    });
+
+    it("F: the daily ceiling is per mailbox (provider/accountId/date), not shared", async () => {
+      const { a, b, ma } = await pair({ limit: 2 });
+
+      // Exhaust mailbox A's ceiling of 2 for today. reserveDailySlot returns a
+      // boolean: true = a slot was consumed, false = the ceiling rejected it.
+      expect(await quota.reserveDailySlot("smtp", a.id, userId, 2)).toBe(true);
+      expect(await quota.reserveDailySlot("smtp", a.id, userId, 2)).toBe(true);
+      expect(await quota.reserveDailySlot("smtp", a.id, userId, 2)).toBe(false);
+
+      // Mailbox B is untouched: the counter is keyed by accountId.
+      expect(await quota.reserveDailySlot("smtp", b.id, userId, 2)).toBe(true);
+      expect(await quota.reserveDailySlot("smtp", b.id, userId, 2)).toBe(true);
+      expect(await quota.reserveDailySlot("smtp", b.id, userId, 2)).toBe(false);
+
+      // Two independent rows, one per mailbox, both for today under "smtp".
+      const rows = await prisma.dailySendCounter.findMany({ where: { userId } });
+      expect(rows).toHaveLength(2);
+      expect(rows.map((r) => r.accountId).sort()).toEqual([a.id, b.id].sort());
+      for (const r of rows) {
+        expect(r.provider).toBe("smtp");
+        expect(r.date).toBe(TODAY());
+        expect(r.messagesSent).toBe(2);
+      }
+
+      // The planning path refuses to plan for a mailbox that is at its ceiling.
+      const plan = await service.planNextSend({ userId, mailboxSettingsId: ma.id });
+      expect(plan.action).toBe("wait");
+      expect(plan.reason).toMatch(/daily send limit/i);
+      expect(plan.job).toBeUndefined();
+      expect(await prisma.warmupJob.count()).toBe(0);
+    });
+
+    it("G: the master warmupEnabled gate still blocks planning and sending", async () => {
+      const { ma } = await pair();
+      // Two enrolled mailboxes, so ONLY the master switch can be the blocker.
+      expect(await service.loadPool(userId)).toHaveLength(2);
+
+      await setDailyLimit(prisma, userId, 100, false); // warmupEnabled = false
+
+      const plan = await service.planNextSend({ userId, mailboxSettingsId: ma.id });
+      expect(plan.action).toBe("stop");
+      expect(plan.reason).toMatch(/switched off in settings/i);
+      expect(plan.job).toBeUndefined();
+      expect(await prisma.warmupJob.count()).toBe(0);
+
+      // The worker respects it too.
+      await worker.warmupTick();
+      expect(sendSmtpMail).not.toHaveBeenCalled();
+      expect(await prisma.warmupJob.count()).toBe(0);
+
+      // Restore for test hygiene (beforeEach resets this anyway).
+      await setDailyLimit(prisma, userId, 100, true);
+      const after = await service.planNextSend({ userId, mailboxSettingsId: ma.id });
+      expect(after.action).toBe("schedule");
+    });
+
+    it("H: receiver candidates are enrolled+enabled only, and never the sender", async () => {
+      // Pure level: same-address rows and the sender itself are excluded.
+      const pool = [
+        { id: "1", email: "a@corp.example" },
+        { id: "2", email: "a@corp.example" }, // duplicate address
+        { id: "3", email: "b@other.example" }, // cross-domain
+      ];
+      const sender = { id: "1", email: "a@corp.example" };
+
+      expect(eligibleReceivers(pool, sender).map((m) => m.id)).toEqual(["3"]);
+      // Cross-domain preference selects 3, and cannot select anything ineligible.
+      expect(pickReceiverPreferCrossDomain(pool, sender, 0)!.id).toBe("3");
+      for (const cursor of [0, 1, 2, 3, 4]) {
+        expect(pickReceiverPreferCrossDomain(pool, sender, cursor)!.id).toBe("3");
+      }
+
+      // Database level: an ENROLLED BUT DISABLED mailbox is not a candidate.
+      const { a, b, ma } = await pair();
+      const c = await createSmtpAccount(prisma, userId, { email: `c-${Date.now()}@test.example` });
+      await enrollMailbox(prisma, userId, c.id, { enabled: false, status: "paused" });
+
+      const poolIds = (await service.loadPool(userId)).map((m) => m.id);
+      expect(poolIds).toHaveLength(2);
+      expect(poolIds).not.toContain(c.id);
+
+      for (const cursor of [0, 1, 2, 3]) {
+        const plan = await service.planNextSend({ userId, mailboxSettingsId: ma.id, cursor });
+        expect(plan.action).toBe("schedule");
+        const job = await prisma.warmupJob.findUniqueOrThrow({ where: { id: plan.job!.id } });
+        expect(job.receiverSmtpAccountId).not.toBe(c.id);
+        expect([a.id, b.id]).toContain(job.receiverSmtpAccountId);
+      }
+    });
   });
 
   it("will not schedule when the SMTP account is disconnected", async () => {
