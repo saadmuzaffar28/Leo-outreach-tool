@@ -22,6 +22,33 @@ export const SMTP_SECURITY_LABELS: Record<string, string> = {
   none: "No encryption (port 25)",
 };
 
+/**
+ * Turn a failed SMTP response into one operator-readable sentence.
+ *
+ * The API returns `{ error, code, responseCode, command, detail }`. Previously
+ * only `error` was rendered, and `error` is a FIXED sentence per classification
+ * -- so every unclassified failure rendered as the same "unrecognised error"
+ * string regardless of what the mail server actually said. The code is what the
+ * server decided to do about the failure; `detail` is the server's own reply,
+ * redacted server-side before it was ever sent here.
+ */
+export function smtpFailureMessage(data: unknown, fallback: string): string {
+  const d = (data && typeof data === "object" ? data : {}) as Record<string, unknown>;
+  const code = typeof d.code === "string" && d.code ? d.code : null;
+  const error = typeof d.error === "string" && d.error ? d.error : null;
+  const detail = typeof d.detail === "string" && d.detail ? d.detail : null;
+
+  const tags: string[] = [];
+  if (typeof d.responseCode === "number") tags.push(`SMTP ${d.responseCode}`);
+  if (typeof d.command === "string" && d.command) tags.push(d.command);
+
+  let out = error ?? code ?? fallback;
+  if (tags.length) out += ` [${tags.join(" / ")}]`;
+  if (code && !out.startsWith(code)) out += ` (${code})`;
+  if (detail) out += ` — ${detail}`;
+  return out;
+}
+
 export function SmtpAccountsManager({ initial }: { initial: SmtpAccountViewDTO[] }) {
   const router = useRouter();
   const [accounts, setAccounts] = useState<SmtpAccountViewDTO[]>(initial);
@@ -80,7 +107,7 @@ export function SmtpAccountsManager({ initial }: { initial: SmtpAccountViewDTO[]
       });
       const data = await res.json().catch(() => ({}));
       if (!res.ok) {
-        throw new Error(data.error ?? data.code ?? "Save failed");
+        throw new Error(smtpFailureMessage(data, "Save failed"));
       }
       await reload();
       resetForm();
@@ -121,8 +148,8 @@ export function SmtpAccountsManager({ initial }: { initial: SmtpAccountViewDTO[]
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ accountId: a.id }),
       });
-      const data = (await res.json().catch(() => ({}))) as { error?: string };
-      if (!res.ok && data.error) setError(data.error);
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok) setError(smtpFailureMessage(data, "Connection test failed"));
     } finally {
       await reload();
       setTestingId(null);

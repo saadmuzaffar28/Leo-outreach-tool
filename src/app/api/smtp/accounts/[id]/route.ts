@@ -3,6 +3,7 @@ import { getSession } from "@/lib/auth";
 import {
   classifySmtpError,
   decryptSmtpCredentials,
+  describeSmtpFailure,
   encryptSmtpCredentials,
   SmtpError,
   testSmtpConnection,
@@ -96,8 +97,9 @@ export async function PATCH(
     await testSmtpConnection({ email, username, password, host, port, security });
   } catch (err) {
     const smtpErr = err instanceof SmtpError ? err : classifySmtpError(err);
+    const diag = describeSmtpFailure(smtpErr);
     return jsonResponse(
-      { error: smtpErr.userMessage, code: smtpErr.code },
+      { error: smtpErr.userMessage, code: smtpErr.code, email, host, port, security, ...diag },
       400
     );
   }

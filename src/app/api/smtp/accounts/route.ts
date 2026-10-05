@@ -3,6 +3,7 @@ import { getSession } from "@/lib/auth";
 import {
   classifySmtpError,
   decryptSmtpCredentials,
+  describeSmtpFailure,
   encryptSmtpCredentials,
   SmtpError,
   testSmtpConnection,
@@ -88,8 +89,13 @@ export async function POST(req: Request) {
     await testSmtpConnection({ email, username, password, host, port, security });
   } catch (err) {
     const smtpErr = err instanceof SmtpError ? err : classifySmtpError(err);
+    // NOTE: nothing is persisted when this branch is taken, so a mailbox that
+    // fails here leaves NO row -- which is why a rejected attempt cannot be
+    // found by looking at /api/smtp/accounts afterwards. The attempted address
+    // is echoed here so the operator can still tell which attempt failed.
+    const diag = describeSmtpFailure(smtpErr);
     return jsonResponse(
-      { error: smtpErr.userMessage, code: smtpErr.code },
+      { error: smtpErr.userMessage, code: smtpErr.code, email, host, port, security, ...diag },
       400
     );
   }

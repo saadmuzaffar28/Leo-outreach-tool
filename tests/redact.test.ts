@@ -9,7 +9,7 @@
  */
 
 import { describe, it, expect, vi, afterEach } from "vitest";
-import { redactText, logSendFailure } from "@/lib/redact";
+import { redactText, logSendFailure, logSmtpDiagnostic } from "@/lib/redact";
 
 afterEach(() => {
   vi.restoreAllMocks();
@@ -137,5 +137,100 @@ describe("logSendFailure", () => {
     expect(entry.recipientId).toBe("recipient-xyz");
     expect(entry.accountId).toBe("account-123");
     expect(entry.attempt).toBe(3);
+  });
+});
+
+describe("logSmtpDiagnostic", () => {
+  function emit(over: Partial<Parameters<typeof logSmtpDiagnostic>[0]> = {}) {
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    const entry = logSmtpDiagnostic({
+      email: "andy@advancedmdmedicalbilling.com",
+      host: "smtp.gmail.com",
+      port: 587,
+      security: "starttls",
+      classifiedAs: "INVALID_CONFIG",
+      detail: "550 5.7.1 Relay access denied",
+      ...over,
+    });
+    warn.mockRestore();
+    return entry;
+  }
+
+  it("carries every field the operator needs to identify the failure", () => {
+    const entry = emit({ smtpErrorName: "Error", smtpErrorCode: "EENVELOPE", responseCode: 550, command: "RCPT" });
+    expect(entry.event).toBe("smtp_diagnostic");
+    expect(entry.email).toBe("andy@advancedmdmedicalbilling.com");
+    expect(entry.host).toBe("smtp.gmail.com");
+    expect(entry.port).toBe(587);
+    expect(entry.security).toBe("starttls");
+    expect(entry.classifiedAs).toBe("INVALID_CONFIG");
+    expect(entry.smtpErrorName).toBe("Error");
+    expect(entry.smtpErrorCode).toBe("EENVELOPE");
+    expect(entry.responseCode).toBe(550);
+    expect(entry.command).toBe("RCPT");
+    expect(entry.detail).toContain("Relay access denied");
+    expect(Number.isNaN(Date.parse(entry.ts))).toBe(false);
+  });
+
+  it("emits exactly one machine-parseable JSON line", () => {
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    logSmtpDiagnostic({
+      email: "a@b.example",
+      host: "h",
+      port: 25,
+      security: "none",
+      classifiedAs: "HOST_UNREACHABLE",
+      detail: "getaddrinfo ENOTFOUND",
+    });
+    expect(warn).toHaveBeenCalledTimes(1);
+    const line = String(warn.mock.calls[0][0]);
+    expect(JSON.parse(line)).toMatchObject({ event: "smtp_diagnostic" });
+    warn.mockRestore();
+  });
+
+  it("redacts credentials and addresses out of the provider detail", () => {
+    const entry = emit({
+      detail: '535 5.7.8 authentication failed: user=leak@evil.example pass="hunter2"',
+    });
+    expect(entry.detail).not.toContain("hunter2");
+    expect(entry.detail).not.toContain("leak@evil.example");
+    expect(entry.detail).toContain("[redacted-credential]");
+    // The account's OWN address is kept: it is the correlation key, not a
+    // recipient, and it is the field that separates a failing mailbox from a
+    // working one on identical configuration.
+    expect(entry.email).toBe("andy@advancedmdmedicalbilling.com");
+  });
+
+  it("drops a command that is not a bare SMTP verb rather than logging free text", () => {
+    // Provider-supplied, so it is whitelisted instead of escaped.
+    expect(emit({ command: "MAIL FROM" }).command).toBeNull();
+    expect(emit({ command: "EHLO" }).command).toBe("EHLO");
+    expect(emit({ command: "EHLO\r\nINJECTED" }).command).toBeNull();
+    expect(emit({ command: 42 as unknown as string }).command).toBeNull();
+  });
+
+  it("coerces a non-integer responseCode to null so it can never be a number elsewhere", () => {
+    expect(emit({ responseCode: "550" as unknown as number }).responseCode).toBeNull();
+    expect(emit({ responseCode: 1.5 }).responseCode).toBeNull();
+    expect(emit({ responseCode: 535 }).responseCode).toBe(535);
+  });
+
+  it("has no field capable of holding a username, password, or ciphertext", () => {
+    // Structural check: the interface itself must not offer a place for one.
+    const entry = emit();
+    const keys = Object.keys(entry);
+    expect(keys).not.toContain("username");
+    expect(keys).not.toContain("password");
+    expect(keys).not.toContain("usernameEncrypted");
+    expect(keys).not.toContain("passwordEncrypted");
+    expect(keys.sort()).toEqual(
+      ["classifiedAs", "command", "detail", "email", "event", "host", "port", "responseCode", "security", "smtpErrorCode", "smtpErrorName", "ts"].sort()
+    );
+  });
+
+  it("caps the detail so one hostile reply cannot flood the log", () => {
+    const entry = emit({ detail: "x".repeat(5000) });
+    expect(entry.detail.length).toBeLessThanOrEqual(401);
+    expect(entry.detail.endsWith("…")).toBe(true);
   });
 });

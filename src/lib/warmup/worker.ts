@@ -1,5 +1,6 @@
 import { prisma } from "@/lib/prisma";
 import { decryptSmtpCredentials, sendSmtpMail, classifySmtpError } from "@/lib/smtp";
+import { logSmtpDiagnostic } from "@/lib/redact";
 import { isWithinWindow } from "@/lib/warmup/ramp";
 import {
   planNextSend,
@@ -167,6 +168,29 @@ async function sendOne(job: DueJob): Promise<void> {
     await bumpWarmupUsage(m.userId, m.id, { warmupSent: 1 });
   } catch (err) {
     const smtpErr = classifySmtpError(err);
+    // Same blind spot as the connection test, and the reason a past warm-up
+    // failure could not be explained: `smtpErr.userMessage` is a fixed sentence
+    // per classification, and a permanent failure wrote ONLY that sentence to
+    // WarmupEvent / WarmupJob.lastError. The reply code and the server's own
+    // words existed nowhere after the process moved on.
+    //
+    // Redacted before logging: `sender.email` is the operator's own address and
+    // is the correlation key, while the detail goes through redactText.
+    {
+      const o = (err && typeof err === "object" ? err : {}) as Record<string, unknown>;
+      logSmtpDiagnostic({
+        email: sender.email,
+        host: sender.host,
+        port: sender.port,
+        security: sender.security,
+        classifiedAs: smtpErr.code,
+        smtpErrorName: typeof o.name === "string" ? o.name : null,
+        smtpErrorCode: typeof o.code === "string" ? o.code : null,
+        responseCode: typeof o.responseCode === "number" ? o.responseCode : null,
+        command: typeof o.command === "string" ? o.command : null,
+        detail: typeof o.message === "string" ? o.message : String(err ?? ""),
+      });
+    }
     // Permanent means "retrying cannot help": bad credentials, a broken
     // configuration, or an address that does not exist. A TEMPORARY
     // classification (any 4xx) is exactly what backoff exists for, so it must

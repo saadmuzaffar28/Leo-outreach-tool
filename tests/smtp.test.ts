@@ -4,6 +4,7 @@ import {
   encryptSmtpCredentials,
   decryptSmtpCredentials,
   classifySmtpError,
+  describeSmtpFailure,
   buildTransporter,
   testSmtpConnection,
   sendSmtpMail,
@@ -236,6 +237,158 @@ describe("smtp lib", () => {
       );
       expect(err).toBeInstanceOf(SmtpError);
       expect((err as SmtpError).code).toBe("CONNECTION_REFUSED");
+    });
+  });
+
+  // -------------------------------------------------------------------------
+  // Server-side diagnostics.
+  //
+  // The catch-all branch's message ends "See server logs for detail", and until
+  // this was added NOTHING wrote to a server log: a failed connection produced
+  // only that generic sentence, so the real cause was unrecoverable. These tests
+  // pin both halves of the fix -- that the detail IS emitted, and that emitting
+  // it never leaks the credential.
+  // -------------------------------------------------------------------------
+  describe("SMTP failure diagnostics", () => {
+    function captureWarn() {
+      const lines: string[] = [];
+      const spy = vi.spyOn(console, "warn").mockImplementation((...args: unknown[]) => {
+        lines.push(args.map((a) => String(a)).join(" "));
+      });
+      return { lines, spy, restore: () => spy.mockRestore() };
+    }
+
+    function diagnosticsOf(lines: string[]) {
+      return lines
+        .map((l) => {
+          try {
+            return JSON.parse(l) as Record<string, unknown>;
+          } catch {
+            return null;
+          }
+        })
+        .filter((j): j is Record<string, unknown> => j?.event === "smtp_diagnostic");
+    }
+
+    it("emits one diagnostic line per failed verify, carrying the real fields", async () => {
+      const cap = captureWarn();
+      try {
+        mockTransporter.verify.mockRejectedValueOnce(
+          Object.assign(new Error("550 5.7.1 Relay access denied"), {
+            code: "EENVELOPE",
+            responseCode: 550,
+            command: "MAIL FROM",
+          })
+        );
+        await testSmtpConnection(decryptedAccount()).then(
+          () => {
+            throw new Error("expected verify() to reject");
+          },
+          () => undefined
+        );
+      } finally {
+        cap.restore();
+      }
+
+      const entries = diagnosticsOf(cap.lines);
+      expect(entries).toHaveLength(1);
+      const e = entries[0];
+
+      expect(e.event).toBe("smtp_diagnostic");
+      // Required fields, all present and correct.
+      expect(typeof e.ts).toBe("string");
+      expect(Number.isNaN(Date.parse(String(e.ts)))).toBe(false);
+      expect(e.email).toBe(GOOD.email);
+      expect(e.host).toBe(GOOD.host);
+      expect(e.port).toBe(GOOD.port);
+      expect(e.security).toBe(GOOD.security);
+      expect(e.smtpErrorName).toBe("Error");
+      expect(e.smtpErrorCode).toBe("EENVELOPE");
+      expect(e.responseCode).toBe(550);
+      // "MAIL FROM" is not a single bare verb, so it is correctly dropped
+      // rather than logged as free text.
+      expect(e.command).toBeNull();
+      // The actual server text -- the thing that was previously lost.
+      expect(String(e.detail)).toContain("Relay access denied");
+    });
+
+    it("never writes the username, password, or ciphertext into the log", async () => {
+      const cap = captureWarn();
+      try {
+        // A hostile/misconfigured relay that QUOTES THE CREDENTIAL back.
+        mockTransporter.verify.mockRejectedValueOnce(
+          new Error(`535 5.7.8 Error: authentication failed: user=${GOOD.username} pass=${SECRET_PASSWORD}`)
+        );
+        await testSmtpConnection(decryptedAccount()).then(
+          () => undefined,
+          () => undefined
+        );
+      } finally {
+        cap.restore();
+      }
+
+      const raw = cap.lines.join("\n");
+      expect(raw.length).toBeGreaterThan(0);
+      expect(raw).not.toContain(SECRET_PASSWORD);
+      // redactText masks the password=... shape and the address in user=...
+      expect(raw).toContain("[redacted-credential]");
+    });
+
+    it("keeps the credential out even when the error is a bare string", async () => {
+      const cap = captureWarn();
+      try {
+        mockTransporter.verify.mockRejectedValueOnce(`plain string failure with ${SECRET_PASSWORD} in it`);
+        await testSmtpConnection(decryptedAccount()).then(
+          () => undefined,
+          () => undefined
+        );
+      } finally {
+        cap.restore();
+      }
+      expect(cap.lines.join("\n")).not.toContain(SECRET_PASSWORD);
+    });
+
+    it("logs nothing when verify succeeds", async () => {
+      const cap = captureWarn();
+      try {
+        mockTransporter.verify.mockResolvedValueOnce(true);
+        await testSmtpConnection(decryptedAccount());
+      } finally {
+        cap.restore();
+      }
+      expect(diagnosticsOf(cap.lines)).toHaveLength(0);
+    });
+
+    describe("describeSmtpFailure", () => {
+      it("recovers the reply code, command, and detail from the preserved cause", () => {
+        const cause = Object.assign(new Error("550 5.7.1 Relay access denied"), {
+          code: "EENVELOPE",
+          responseCode: 550,
+          command: "RCPT",
+        });
+        const err = classifySmtpError(cause);
+        // The message is generic on purpose...
+        expect(err.userMessage).toMatch(/unrecognised/i);
+        // ...but the real detail is still reachable.
+        const d = describeSmtpFailure(err);
+        expect(d.responseCode).toBe(550);
+        expect(d.command).toBe("RCPT");
+        expect(d.detail).toContain("Relay access denied");
+      });
+
+      it("redacts credentials out of the detail it returns to the caller", () => {
+        const cause = new Error(`535 rejected pass=${SECRET_PASSWORD}`);
+        const d = describeSmtpFailure(classifySmtpError(cause));
+        expect(d.detail).not.toContain(SECRET_PASSWORD);
+        expect(d.responseCode).toBeNull();
+        expect(d.command).toBeNull();
+      });
+
+      it("does not throw when the cause carries a non-numeric responseCode", () => {
+        const cause = Object.assign(new Error("odd"), { responseCode: "550" as unknown as number });
+        const d = describeSmtpFailure(classifySmtpError(cause));
+        expect(d.responseCode).toBeNull();
+      });
     });
   });
 

@@ -43,8 +43,19 @@ const PATTERNS: ReadonlyArray<readonly [RegExp, string]> = [
   [/\b(?:ya29\.[\w-]+|1\/\/\S{10,}|gh[opsu]_-?[\w-]{8,})/g, "[redacted-token]"],
 
   // `access_token=…`, `"refreshToken": "…"`, `password=…`, `Authorization: Bearer …`.
+  //
+  // `pass` is listed SEPARATELY from `password` rather than relying on the
+  // `password` alternative: `\bpassword\b` cannot match inside "password" if
+  // "pass" is tried first, because "pass" followed by "word" has no word
+  // boundary -- so the two alternatives are independent and neither shadows the
+  // other. Bare `pass=` is not hypothetical: SMTP and IMAP servers are the most
+  // likely source of an echoed credential in this system, and several quote it
+  // as `pass=` rather than `password=`.
+  //
+  // `\bpass\b` + a mandatory `[:=]` means ordinary prose ("pass validation")
+  // is unaffected -- the separator is required.
   [
-    /\b(?:access[_-]?token|refresh[_-]?token|id[_-]?token|token|password|passwd|pwd|secret|passphrase|bearer)\b\s*"?\s*[:=]\s*"?[^\s",}]+/gi,
+    /\b(?:access[_-]?token|refresh[_-]?token|id[_-]?token|token|password|passwd|pwd|pass|secret|passphrase|bearer)\b\s*"?\s*[:=]\s*"?[^\s",}]+/gi,
     "[redacted-credential]",
   ],
 
@@ -124,6 +135,100 @@ export function logSendFailure(fields: Omit<SendFailureLog, "event" | "ts" | "de
     action: fields.action,
     retryAfterSeconds: fields.retryAfterSeconds,
     detail: redactText(fields.detail),
+  };
+  console.warn(JSON.stringify(entry));
+  return entry;
+}
+
+/**
+ * The fields a structured SMTP diagnostic line is allowed to carry.
+ *
+ * WHAT THIS EXISTS FOR
+ *
+ * `classifySmtpError` deliberately refuses to echo the server's own text back to
+ * the user, because that text is stored on `WarmupJob.lastError`, written into
+ * `WarmupEvent` rows, and returned over HTTP -- and SMTP servers quote
+ * credentials back (Postfix: "535 5.7.8 Error: authentication failed:
+ * user=user@example.com"). The catch-all branch therefore ends in "SMTP
+ * connection failed with an unrecognised error. See server logs for detail."
+ *
+ * That promise was never kept: NOTHING wrote to a server log. The only record of
+ * a failure was that same generic string, so the diagnostic detail the message
+ * pointed at did not exist anywhere and was unrecoverable after the fact.
+ *
+ * So the detail is logged HERE instead -- server-side, structured, and passed
+ * through {@link redactText} so the credential shapes the classifier refuses to
+ * forward never reach the log either.
+ *
+ * There is deliberately NO field for a username, a password, or either
+ * encrypted blob. The account's own address IS included: it is the operator's
+ * own input, it is the single most useful correlation key when one mailbox
+ * fails and eight succeed, and it is not a recipient.
+ */
+export interface SmtpDiagnosticLog {
+  event: "smtp_diagnostic";
+  ts: string;
+  email: string;
+  host: string;
+  port: number;
+  security: string;
+  /** The classified `SmtpError.code` -- what the app decided to do about it. */
+  classifiedAs: string;
+  /** Nodemailer's own `err.name` (e.g. "Error"). */
+  smtpErrorName: string | null;
+  /** Nodemailer's `err.code` (e.g. "EAUTH", "ECONNREFUSED"). */
+  smtpErrorCode: string | null;
+  /** The SMTP reply status (e.g. 535, 550), when the server sent one. */
+  responseCode: number | null;
+  /** The SMTP verb that failed (e.g. "EHLO", "AUTH"). Whitelisted, never free text. */
+  command: string | null;
+  /** Redacted provider text. This is the part the UI cannot show. */
+  detail: string;
+}
+
+/** SMTP verbs nodemailer can report. Anything else is dropped, not truncated. */
+const SMTP_COMMAND = /^[A-Za-z]{1,12}$/;
+
+/**
+ * Build the structured line for an SMTP connection failure and emit it.
+ *
+ * Emits exactly one JSON line so it can be grepped by `event` and by
+ * `email`. `command` is validated against a verb whitelist because it is
+ * provider-supplied, and `responseCode` is coerced to an integer or dropped
+ * because it is used to decide retry behaviour elsewhere -- a non-numeric
+ * value in this log must never become a number somewhere else.
+ */
+export function logSmtpDiagnostic(fields: {
+  email: string;
+  host: string;
+  port: number;
+  security: string;
+  classifiedAs: string;
+  smtpErrorName?: unknown;
+  smtpErrorCode?: unknown;
+  responseCode?: unknown;
+  command?: unknown;
+  detail: string;
+}): SmtpDiagnosticLog {
+  const responseCode =
+    typeof fields.responseCode === "number" && Number.isInteger(fields.responseCode)
+      ? fields.responseCode
+      : null;
+  const command =
+    typeof fields.command === "string" && SMTP_COMMAND.test(fields.command) ? fields.command : null;
+  const entry: SmtpDiagnosticLog = {
+    event: "smtp_diagnostic",
+    ts: new Date().toISOString(),
+    email: fields.email,
+    host: fields.host,
+    port: fields.port,
+    security: fields.security,
+    classifiedAs: fields.classifiedAs,
+    smtpErrorName: typeof fields.smtpErrorName === "string" ? fields.smtpErrorName.slice(0, 80) : null,
+    smtpErrorCode: typeof fields.smtpErrorCode === "string" ? fields.smtpErrorCode.slice(0, 80) : null,
+    responseCode,
+    command,
+    detail: redactText(fields.detail, 400),
   };
   console.warn(JSON.stringify(entry));
   return entry;

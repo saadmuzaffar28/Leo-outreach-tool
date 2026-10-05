@@ -1,5 +1,6 @@
 import nodemailer, { type Transporter } from "nodemailer";
 import { decrypt, encrypt } from "@/lib/encryption";
+import { logSmtpDiagnostic, redactText } from "@/lib/redact";
 
 /**
  * Generic SMTP / custom-email provider.
@@ -117,6 +118,58 @@ export function classifySmtpError(err: unknown): SmtpError {
 }
 
 /**
+ * Nodemailer's own diagnostic fields, read off the RAW error.
+ *
+ * `classifySmtpError` throws away everything except a code and a fixed
+ * sentence, and that is correct for a message that gets stored and served to
+ * the browser -- but it means the interesting parts (the SMTP reply code, the
+ * verb that failed, the server's own words) survive ONLY on the preserved
+ * `cause`. This pulls them back out for the server-side log.
+ *
+ * Every field is read defensively: nodemailer is not the only caller, and a
+ * thrown value may be a bare string.
+ */
+function smtpCauseFields(err: unknown): {
+  name: string | null;
+  code: string | null;
+  responseCode: number | null;
+  command: string | null;
+  message: string;
+} {
+  const o = (err && typeof err === "object" ? err : {}) as Record<string, unknown>;
+  const message = typeof o.message === "string" ? o.message : String(err ?? "");
+  return {
+    name: typeof o.name === "string" ? o.name : null,
+    code: typeof o.code === "string" ? o.code : null,
+    responseCode:
+      typeof o.responseCode === "number" && Number.isInteger(o.responseCode) ? o.responseCode : null,
+    command: typeof o.command === "string" ? o.command : null,
+    message,
+  };
+}
+
+/**
+ * The subset of an SMTP failure that is safe to hand back to the operator.
+ *
+ * `detail` is redacted and capped, so it cannot become the credential-injection
+ * channel the classifier comment above is worried about, while still naming the
+ * actual server response instead of "an unrecognised error".
+ */
+export function describeSmtpFailure(err: SmtpError): {
+  responseCode: number | null;
+  command: string | null;
+  detail: string;
+} {
+  const cause = (err as { cause?: unknown }).cause;
+  const f = smtpCauseFields(cause ?? err);
+  return {
+    responseCode: f.responseCode,
+    command: f.command,
+    detail: redactText(f.message, 200),
+  };
+}
+
+/**
  * Build a nodemailer transporter. The password is decrypted here (in memory)
  * and immediately used; it is never captured, logged, or returned.
  */
@@ -163,13 +216,55 @@ export interface SmtpAccountView {
   createdAt: Date | string;
 }
 
+/**
+ * Strip this account's OWN plaintext secrets out of a diagnostic string.
+ *
+ * `redactText` matches credential SHAPES (`pass=…`, `password: …`, a bearer
+ * token, an `iv:cipher:tag` blob). A shape-based filter cannot see a bare
+ * secret sitting in a sentence with no `key=` label -- which is exactly how a
+ * password arrives when the server echoes it inside prose.
+ *
+ * Here the plaintext password is in hand, so it is removed by VALUE rather than
+ * by shape. That turns "NEVER log the password" from a probabilistic promise
+ * into a guarantee for the one code path that actually holds the secret.
+ * Short values are skipped so a 1-3 character password cannot blank out the
+ * entire message.
+ */
+function stripOwnSecrets(text: string, account: { username: string; password: string }): string {
+  let out = text;
+  for (const secret of [account.password, account.username]) {
+    if (secret && secret.length >= 4) {
+      out = out.split(secret).join("[redacted-credential]");
+    }
+  }
+  return out;
+}
+
 /** Actually authenticate against the SMTP server using nodemailer's verify(). */
 export async function testSmtpConnection(account: DecryptedSmtpAccount): Promise<void> {
   const transporter = buildTransporter(account);
   try {
     await transporter.verify();
   } catch (err) {
-    throw classifySmtpError(err);
+    const classified = classifySmtpError(err);
+    // The catch-all branch's message ends "See server logs for detail", and this
+    // is the line that keeps that promise. Without it the diagnostic fields
+    // existed only on the in-memory `cause` and were unrecoverable once the
+    // request ended -- which is why a past failure could not be explained at all.
+    const f = smtpCauseFields(err);
+    logSmtpDiagnostic({
+      email: account.email,
+      host: account.host,
+      port: account.port,
+      security: account.security,
+      classifiedAs: classified.code,
+      smtpErrorName: f.name,
+      smtpErrorCode: f.code,
+      responseCode: f.responseCode,
+      command: f.command,
+      detail: stripOwnSecrets(f.message, account),
+    });
+    throw classified;
   } finally {
     transporter.close();
   }
