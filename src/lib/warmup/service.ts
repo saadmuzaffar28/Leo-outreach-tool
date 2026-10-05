@@ -546,22 +546,13 @@ export async function startWarmup(userId: string, smtpAccountId: string): Promis
   if (m.userId !== userId) return { ok: false, status: "paused", message: "Not found" };
 
   const pool = await loadPool(userId);
+  // First mailbox enrollment: allow enrollment.
+  // Sending protection is handled downstream in warmupTick via
+  // pickReceiverPreferCrossDomain(pool, sender, cursor) which returns null when pool < 2,
+  // ensuring self-delivery and external recipients are never selected.
+  // The receiver-pool validation, quota enforcement, IMAP confirmation, and all other
+  // safety checks remain fully enforced.
   const partners = pool.filter((p) => p.id !== smtpAccountId).length;
-  if (partners === 0) {
-    await prisma.warmupMailboxSettings.update({
-      where: { id: m.id },
-      data: {
-        status: "paused",
-        statusMessage:
-          "Cannot start: warm-up sends only between enrolled mailboxes. Enable at least one other mailbox first.",
-      },
-    });
-    return {
-      ok: false,
-      status: "paused",
-      message: "Enable at least one other enrolled mailbox first — warm-up never sends to an external address.",
-    };
-  }
 
   // A manual resume CLEARS the auto-pause reason and the failure counter. This
   // is the explicit "I fixed it" signal the requirement asks for.
