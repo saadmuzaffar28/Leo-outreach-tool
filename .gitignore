@@ -30,6 +30,12 @@ yarn-error.log*
 db.log*
 *.pid
 
+# ownership marker written by the leo-db supervisor (scripts/dev-db.mjs).
+# Records which postmaster PID this machine's supervisor is responsible for, so
+# a restarted wrapper can still shut it down cleanly. Machine-local state, not
+# part of the repository.
+/.leo-db-owner.json
+
 # typescript
 *.tsbuildinfo
 
@@ -60,3 +66,17 @@ db.log*
 # Zero-byte artefacts from a shell redirect that was missing its target file.
 /newestGoogle.updatedAt.getTime())/
 /newestMicrosoft.updatedAt.getTime())/
+
+# ---------------------------------------------------------------------------
+# Added for the GitHub push.
+# ---------------------------------------------------------------------------
+
+# Compiled worker bundle. Generated from src/ by the workers tsconfig, so
+# committing it would only add a second copy that drifts out of date.
+/dist/
+
+# Runtime log directory. The *.log rules already caught the individual files,
+# but observe.jsonl (output from scripts/lib/observe.mjs) slipped through
+# because *.log does not match .jsonl. Ignoring the whole directory closes
+# that class of leak instead of one filename.
+/logs/
