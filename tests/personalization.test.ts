@@ -32,6 +32,23 @@ describe("personalize", () => {
   });
 });
 
+describe("personalize with missing optional lead fields", () => {
+  it("TEST 12: missing first name does not crash and resolves to empty", () => {
+    // An email-only lead has no name/company data at all.
+    const values = { email: "john@example.com" };
+    expect(() => personalize("Hi {{first_name}},", values)).not.toThrow();
+    expect(personalize("Hi {{first_name}},", values)).toBe("Hi ,");
+    expect(personalize("Hello {{first_name}} {{last_name}} at {{practice_name}}", values)).toBe(
+      "Hello   at ",
+    );
+    // An explicitly empty string behaves exactly like a missing value.
+    expect(personalize("Hi {{first_name}}", { first_name: "" })).toBe("Hi ");
+    expect(personalize("Hi {{first_name}}", { first_name: "" }, "friend")).toBe("Hi friend");
+    // The subject filler is safe too (identical substitution path).
+    expect(personalize("Follow-up for {{first_name}}", values).trim()).toBe("Follow-up for");
+  });
+});
+
 describe("assertOnlySupportedVariables", () => {
   it("accepts supported variables", () => {
     expect(() => assertOnlySupportedVariables("Hi {{first_name}} {{practice_name}}")).not.toThrow();

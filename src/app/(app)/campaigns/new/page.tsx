@@ -20,7 +20,7 @@ export default async function NewCampaignPage({
     prisma.smtpAccount.findMany({
       where: { userId: session.sub },
       orderBy: { createdAt: "desc" },
-      select: { id: true, email: true },
+      select: { id: true, email: true, status: true, displayName: true },
     }),
     prisma.emailTemplate.findMany({
       where: { userId: session.sub, isActive: true },
@@ -37,7 +37,13 @@ export default async function NewCampaignPage({
       provider: "microsoft" as const,
       email: a.microsoftEmail,
     })),
-    ...smtpAccounts.map((a) => ({ id: a.id, provider: "smtp" as const, email: a.email })),
+    ...smtpAccounts.map((a) => ({
+      id: a.id,
+      provider: "smtp" as const,
+      email: a.email,
+      status: a.status,
+      displayName: a.displayName,
+    })),
   ];
 
   return (

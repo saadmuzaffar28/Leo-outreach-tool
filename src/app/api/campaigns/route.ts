@@ -12,7 +12,14 @@ export async function GET() {
   const campaigns = await prisma.campaign.findMany({
     where: { userId: session.sub },
     orderBy: { updatedAt: "desc" },
-    include: { template: true, googleAccount: true, microsoftAccount: true, smtpAccount: true, recipientGroup: true },
+    include: {
+      template: true,
+      googleAccount: true,
+      microsoftAccount: true,
+      smtpAccount: true,
+      recipientGroup: true,
+      sendingAccounts: { include: { smtpAccount: true }, orderBy: { position: "asc" } },
+    },
   });
 
   const ids = campaigns.map((c) => c.id);
@@ -47,6 +54,11 @@ export async function GET() {
       smtpEmail: c.smtpAccount?.email ?? null,
       senderEmail: c.googleAccount?.googleEmail ?? c.microsoftAccount?.microsoftEmail ?? c.smtpAccount?.email ?? null,
       senderProvider: c.smtpAccount ? "smtp" : c.microsoftAccount ? "microsoft" : c.googleAccount ? "google" : null,
+      smtpMailboxes: c.sendingAccounts.map((s) => ({
+        id: s.smtpAccountId,
+        email: s.smtpAccount?.email ?? null,
+      })),
+      smtpMailboxCount: c.sendingAccounts.length,
       createdAt: c.createdAt,
       updatedAt: c.updatedAt,
       startedAt: c.startedAt,
@@ -71,12 +83,18 @@ export async function POST(req: Request) {
   const parsed = campaignCreateSchema.safeParse(body);
   if (!parsed.success) return badRequest(parsed.error.issues[0]?.message ?? "Invalid campaign");
 
-  const provider = parsed.data.smtpAccountId
-    ? "smtp"
-    : parsed.data.microsoftAccountId
-      ? "microsoft"
-      : "google";
-  const accountId = parsed.data.smtpAccountId ?? parsed.data.microsoftAccountId ?? parsed.data.googleAccountId!;
+  // Multi-mailbox selection (1..N connected SMTP mailboxes). The legacy
+  // single-account fields keep working: `smtpAccountId` is treated as a
+  // one-element selection, and Gmail/Outlook campaigns are unchanged.
+  const selectedSmtpIds = Array.from(
+    new Set(parsed.data.smtpAccountIds ?? (parsed.data.smtpAccountId ? [parsed.data.smtpAccountId] : [])),
+  );
+  const isSmtp = selectedSmtpIds.length > 0;
+  const isMicrosoft = Boolean(parsed.data.microsoftAccountId);
+  const isGoogle = Boolean(parsed.data.googleAccountId);
+  const accountId = isSmtp
+    ? selectedSmtpIds[0]
+    : (parsed.data.microsoftAccountId ?? parsed.data.googleAccountId!);
 
   // A campaign may target a group. The id is validated up front so a bad or
   // foreign group is rejected at creation time rather than at send time.
@@ -89,25 +107,44 @@ export async function POST(req: Request) {
     recipientGroup = { id: found.id, name: found.name };
   }
 
-  const [template, googleAccount, microsoftAccount, smtpAccount, leadCount] = await Promise.all([
+  const [template, googleAccount, microsoftAccount, smtpAccounts, leadCount] = await Promise.all([
     prisma.emailTemplate.findUnique({ where: { id: parsed.data.templateId } }),
-    provider === "google"
+    isGoogle
       ? prisma.googleAccount.findUnique({ where: { id: accountId } })
       : Promise.resolve(null),
-    provider === "microsoft"
+    isMicrosoft
       ? prisma.microsoftAccount.findUnique({ where: { id: accountId } })
       : Promise.resolve(null),
-    provider === "smtp"
-      ? prisma.smtpAccount.findUnique({ where: { id: accountId } })
-      : Promise.resolve(null),
+    isSmtp
+      ? prisma.smtpAccount.findMany({ where: { id: { in: selectedSmtpIds } } })
+      : Promise.resolve([]),
     prisma.lead.count({ where: groupLeadWhere(session.sub, recipientGroup?.id ?? null) }),
   ]);
 
   if (!template || template.userId !== session.sub)
     return notFound("Template not found");
-  const account = provider === "google" ? googleAccount : provider === "microsoft" ? microsoftAccount : smtpAccount;
-  if (!account || account.userId !== session.sub)
-    return notFound("Sending account not found");
+
+  if (isGoogle || isMicrosoft) {
+    const account = isGoogle ? googleAccount : microsoftAccount;
+    if (!account || account.userId !== session.sub)
+      return notFound("Sending account not found");
+  } else {
+    // SMTP: preserve the operator's chosen order, and reject unknown, foreign
+    // or disconnected mailboxes — a mailbox that can't send today must not be
+    // newly selectable.
+    const smtpById = new Map(smtpAccounts.map((a) => [a.id, a]));
+    const orderedSmtp = selectedSmtpIds
+      .map((id) => smtpById.get(id))
+      .filter((a): a is NonNullable<typeof a> => Boolean(a));
+    if (orderedSmtp.length !== selectedSmtpIds.length)
+      return notFound("Sending account not found");
+    if (orderedSmtp.some((a) => a.userId !== session.sub))
+      return notFound("Sending account not found");
+    const disconnected = orderedSmtp.find((a) => a.status !== "connected");
+    if (disconnected)
+      return badRequest(`Mailbox "${disconnected.email}" is not connected. Reconnect it in Settings first.`);
+  }
+
   if (leadCount === 0)
     return badRequest(
       recipientGroup
@@ -120,14 +157,27 @@ export async function POST(req: Request) {
       userId: session.sub,
       name: parsed.data.name,
       templateId: template.id,
-      ...(provider === "google"
-        ? { googleAccountId: account.id }
-        : provider === "microsoft"
-          ? { microsoftAccountId: account.id }
-          : { smtpAccountId: account.id }),
+      ...(isGoogle
+        ? { googleAccountId: accountId }
+        : isMicrosoft
+          ? { microsoftAccountId: accountId }
+          : { smtpAccountId: selectedSmtpIds[0] }),
+      // The full multi-mailbox selection in deterministic position order. The
+      // first mailbox also fills the legacy Campaign.smtpAccountId so existing
+      // reads (list, detail, pause-by-account) keep working unchanged.
+      ...(isSmtp
+        ? {
+            sendingAccounts: {
+              create: selectedSmtpIds.map((id, i) => ({ smtpAccountId: id, position: i })),
+            },
+          }
+        : {}),
       recipientGroupId: recipientGroup?.id ?? null,
       // null (not "") so the worker falls back to the global SENDER_NAME.
       senderName: parsed.data.senderName ?? null,
+      // Verification policy defaults to OFF in the schema — existing campaigns
+      // and older clients keep their previous send behaviour.
+      verificationPolicy: parsed.data.verificationPolicy ?? "OFF",
       status: "draft",
     },
   });

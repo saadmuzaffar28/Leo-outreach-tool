@@ -246,8 +246,9 @@ export function LeadImport({ groups = [] }: { groups?: GroupOption[] }) {
               {fileName ?? "Click to choose a CSV file"}
             </label>
             <p className="mt-2 text-xs text-slate-400">
-              Expects: <code>Name</code>, <code>Company Name</code>, <code>Email</code>, <code>Phone</code>{" "}
-              (also accepts: first_name, last_name, practice_name, custom_field_1/2)
+              Email is required; every other column is optional. Recognized: <code>Name</code>,{" "}
+              <code>Company Name</code>, <code>Email</code>, <code>Phone</code> (also first_name,
+              last_name, practice_name, custom_field_1/2)
             </p>
           </div>
 

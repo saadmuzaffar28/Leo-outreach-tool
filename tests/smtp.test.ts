@@ -9,6 +9,8 @@ import {
   testSmtpConnection,
   sendSmtpMail,
   summarizeSmtpSend,
+  smtpSenderName,
+  normalizeDisplayName,
   type SmtpAccountInput,
   type SmtpAccountView,
   type SmtpSecurity,
@@ -70,6 +72,9 @@ function viewFromAccount(): SmtpAccountView {
     lastTestedAt: new Date(),
     lastTestError: null,
     createdAt: new Date(),
+    signatureEnabled: false,
+    signatureHtml: null,
+    displayName: null,
   };
 }
 
@@ -118,6 +123,41 @@ describe("smtp lib", () => {
       );
       expect(err).toBeInstanceOf(SmtpError);
       expect(err.code).toBe("AUTH_FAILED");
+    });
+
+    it("classifies Google 534 5.7.14 'please log in via web browser' as AUTH_FAILED and suggests an App Password", () => {
+      // Exact shape of the real Gmail reply from the smtp_diagnostic server log:
+      //   Invalid login: 534-5.7.14 <https://accounts.google.com/signin/continue?...>
+      //   534 5.7.14 Please log in via your web browser and then try again.
+      const err = classifySmtpError(
+        Object.assign(
+          new Error(
+            "Invalid login: 534-5.7.14 <https://accounts.google.com/signin/continue?plt=AKgnsbs> " +
+              "534 5.7.14 Please log in via your web browser and then try again."
+          ),
+          { code: "EAUTH", responseCode: 534, command: "AUTH PLAIN" }
+        )
+      );
+      expect(err).toBeInstanceOf(SmtpError);
+      expect(err.code).toBe("AUTH_FAILED");
+      expect(err.userMessage).toMatch(/App Password/i);
+      expect(err.userMessage).toMatch(/2-Step Verification/i);
+    });
+
+    it("classifies a bare EAUTH-code failure as AUTH_FAILED with the generic message", () => {
+      const err = classifySmtpError(
+        Object.assign(new Error("Invalid login."), { code: "EAUTH", responseCode: 535 })
+      );
+      expect(err.code).toBe("AUTH_FAILED");
+      expect(err.userMessage).toContain("Check the username and password");
+    });
+
+    it("keeps transient 4xx replies classified as TEMPORARY", () => {
+      const err = classifySmtpError(
+        Object.assign(new Error("421 4.7.0 Try again later"), { code: "EENVELOPE", responseCode: 421 })
+      );
+      expect(err.code).toBe("TEMPORARY");
+      expect(err.userMessage).toMatch(/transient/i);
     });
 
     it("classifies TLS/SSL failures", () => {
@@ -432,6 +472,134 @@ describe("smtp lib", () => {
       );
       expect(err).toBeInstanceOf(SmtpError);
       expect((err as SmtpError).code).toBe("AUTH_FAILED");
+    });
+
+    it("builds From as { name, address } when a sender name is supplied", async () => {
+      mockTransporter.sendMail.mockResolvedValueOnce({ messageId: "m2" });
+      const account = { ...decryptedAccount(), displayName: "Lucas" };
+      await sendSmtpMail(account, {
+        to: "clinic@example.com",
+        subject: "RCM audit",
+        html: "<p>hi</p>",
+        fromName: "Lucas",
+      });
+      const args = mockTransporter.sendMail.mock.calls[0][0] as { from: unknown };
+      // nodemailer's Address-object form — the ADDRESS is ALWAYS the sending
+      // mailbox; the name can never replace or alter it.
+      expect(args.from).toEqual({ name: "Lucas", address: GOOD.email });
+    });
+
+    it("keeps the mailbox address when the display name differs from the address", async () => {
+      mockTransporter.sendMail.mockResolvedValueOnce({ messageId: "m3" });
+      await sendSmtpMail(decryptedAccount(), {
+        to: "clinic@example.com",
+        subject: "x",
+        html: "y",
+        fromName: "Scott",
+      });
+      const args = mockTransporter.sendMail.mock.calls[0][0] as { from: { name: string; address: string } };
+      expect(args.from).toEqual({ name: "Scott", address: GOOD.email });
+      expect(args.from.address).toBe(GOOD.email);
+    });
+
+    it("CR/LF injection in a sender name is neutralised before the From is built", async () => {
+      mockTransporter.sendMail.mockResolvedValueOnce({ messageId: "m4" });
+      await sendSmtpMail(decryptedAccount(), {
+        to: "clinic@example.com",
+        subject: "x",
+        html: "y",
+        // A classic header-injection payload. Must end up as a single-line name.
+        fromName: "Lucas\r\nBcc: attacker@example.com\r\nX-Evil: 1",
+      });
+      const args = mockTransporter.sendMail.mock.calls[0][0] as {
+        from: { name: string; address: string };
+      };
+      expect(args.from.name).toBe("Lucas Bcc: attacker@example.com X-Evil: 1");
+      expect(args.from.name).not.toContain("\r");
+      expect(args.from.name).not.toContain("\n");
+      expect(args.from.address).toBe(GOOD.email);
+    });
+
+    it("without a fromName the historical neutral From form is preserved byte-for-byte", async () => {
+      mockTransporter.sendMail.mockResolvedValueOnce({ messageId: "m5" });
+      await sendSmtpMail(decryptedAccount(), {
+        to: "clinic@example.com",
+        subject: "x",
+        html: "y",
+      });
+      const args = mockTransporter.sendMail.mock.calls[0][0] as { from: string };
+      expect(args.from).toBe(`"${GOOD.email}" <${GOOD.email}>`);
+    });
+  });
+
+  describe("smtpSenderName — per-mailbox display-name resolution", () => {
+    it("Lucas: configured display name wins and the address stays the mailbox", () => {
+      expect(smtpSenderName({ displayName: "Lucas", email: "lucas@collabrevsolution.org" })).toBe(
+        "Lucas",
+      );
+    });
+
+    it("Scott: configured display name wins", () => {
+      expect(smtpSenderName({ displayName: "Scott", email: "scott@collabrevsolutions.online" })).toBe(
+        "Scott",
+      );
+    });
+
+    it("falls back to the capitalized local part when no name is configured", () => {
+      expect(smtpSenderName({ displayName: null, email: "lucas@collabrevsolution.org" })).toBe(
+        "Lucas",
+      );
+      expect(smtpSenderName({ displayName: undefined, email: "scott@collabrevsolutions.online" })).toBe(
+        "Scott",
+      );
+    });
+
+    it("separators in the local part fall back to the leading segment", () => {
+      expect(smtpSenderName({ email: "scott.brown@clinic.example" })).toBe("Scott");
+      expect(smtpSenderName({ email: "sales_team@clinic.example" })).toBe("Sales");
+      expect(smtpSenderName({ email: "info+jobs@clinic.example" })).toBe("Info");
+    });
+
+    it("names containing spaces are preserved verbatim", () => {
+      expect(smtpSenderName({ displayName: "Lucas Smith", email: "lucas@x.example" })).toBe(
+        "Lucas Smith",
+      );
+    });
+
+    it("a unicode display name passes through (encoding is nodemailer's job)", () => {
+      expect(
+        smtpSenderName({ displayName: "José García", email: "jose@x.example" }),
+      ).toBe("José García");
+    });
+
+    it("CR/LF injection attempts collapse to a single-line value", () => {
+      expect(
+        smtpSenderName({ displayName: "Lucas\r\nBcc: evil@example.com", email: "lucas@x.example" }),
+      ).toBe("Lucas Bcc: evil@example.com");
+      expect(
+        smtpSenderName({ displayName: "Bob\nTheo", email: "bob@x.example" }),
+      ).toBe("Bob Theo");
+    });
+
+    it("an empty/whitespace-only configured name behaves like NULL", () => {
+      expect(smtpSenderName({ displayName: "   ", email: "lucas@collabrevsolution.org" })).toBe(
+        "Lucas",
+      );
+    });
+  });
+
+  describe("normalizeDisplayName — stored-value sanitisation", () => {
+    it("returns null for null/undefined/empty", () => {
+      expect(normalizeDisplayName(null)).toBeNull();
+      expect(normalizeDisplayName(undefined)).toBeNull();
+      expect(normalizeDisplayName("")).toBeNull();
+      expect(normalizeDisplayName("  \t ")).toBeNull();
+    });
+
+    it("collapses control characters to spaces and trims", () => {
+      expect(normalizeDisplayName("  Lucas\nSmith  ")).toBe("Lucas Smith");
+      expect(normalizeDisplayName("a\u0000b")).toBe("a b");
+      expect(normalizeDisplayName("a\r\nb")).toBe("a b");
     });
   });
 

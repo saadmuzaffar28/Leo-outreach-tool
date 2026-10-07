@@ -5,6 +5,7 @@ import { ToastProvider } from "@/components/sms/toast";
 
 const NAV = [
   { href: "/leads", label: "Leads" },
+  { href: "/verification", label: "Verify" },
   { href: "/templates", label: "Templates" },
   { href: "/campaigns", label: "Campaigns" },
   { href: "/warmup", label: "Warm-up" },

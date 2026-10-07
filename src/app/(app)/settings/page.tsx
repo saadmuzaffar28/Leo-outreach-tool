@@ -45,6 +45,9 @@ export default async function SettingsPage({
         lastTestedAt: true,
         lastTestError: true,
         createdAt: true,
+        signatureEnabled: true,
+        signatureHtml: true,
+        displayName: true,
       },
     }),
     prisma.suppression.findMany({ where: { userId: session.sub }, orderBy: { createdAt: "desc" } }),
@@ -272,6 +275,9 @@ export default async function SettingsPage({
             lastTestedAt: a.lastTestedAt ? a.lastTestedAt.toISOString() : null,
             lastTestError: a.lastTestError,
             createdAt: a.createdAt.toISOString(),
+            signatureEnabled: a.signatureEnabled,
+            signatureHtml: a.signatureHtml,
+            displayName: a.displayName,
           }))}
         />
       </Card>

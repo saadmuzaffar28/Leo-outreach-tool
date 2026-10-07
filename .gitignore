@@ -30,10 +30,10 @@ yarn-error.log*
 db.log*
 *.pid
 
-# ownership marker written by the leo-db supervisor (scripts/dev-db.mjs).
-# Records which postmaster PID this machine's supervisor is responsible for, so
-# a restarted wrapper can still shut it down cleanly. Machine-local state, not
-# part of the repository.
+# ownership marker written by the (now removed) leo-db supervisor
+# (scripts/dev-db.mjs, deleted 2026-10-06). Kept ignored because a stale copy
+# may still exist on disk from before the move to the LeoPostgres Windows
+# service. Machine-local state, never part of the repository.
 /.leo-db-owner.json
 
 # typescript

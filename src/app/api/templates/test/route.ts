@@ -10,7 +10,7 @@ import {
   getAuthorizedMicrosoft,
   sendMicrosoftMail,
 } from "@/lib/microsoft";
-import { plainTextToHtml } from "@/lib/message";
+import { resolveSignatureForSend } from "@/lib/signature";
 import type { MailMessage } from "@/lib/message";
 import { env } from "@/lib/env";
 
@@ -58,20 +58,20 @@ export async function POST(req: Request) {
   const subject = `[TEST] ${personalize(parsed.data.template.subject, PREVIEW_LEAD).trim()}`;
   const bodyText = personalize(parsed.data.template.body, PREVIEW_LEAD);
 
-  const useSignature = parsed.data.template.useSignature !== false;
-  let signatureHtml: string | null = null;
-  if (useSignature) {
-    const templateSig = parsed.data.template.signatureOverride?.trim();
-    signatureHtml = templateSig
-      ? plainTextToHtml(templateSig)
-      : useMicrosoft
-        ? (microsoftAccount!.signatureOverride
-            ? plainTextToHtml(microsoftAccount!.signatureOverride)
-            : null)
-        : account!.signatureOverride
-          ? plainTextToHtml(account!.signatureOverride)
-          : (accountData as Awaited<ReturnType<typeof decryptAccount>>).signature;
-  }
+  // Test/manual sends resolve the signature through the same shared function the
+  // campaign worker uses, so the selected account's own signature always ships.
+  const signatureHtml = resolveSignatureForSend({
+    templateUseSignature: parsed.data.template.useSignature !== false,
+    templateOverride: parsed.data.template.signatureOverride?.trim() || null,
+    accountSignatureEnabled: false, // test sends use Google/Outlook accounts
+    accountSignatureHtml: null,
+    accountOverride: useMicrosoft
+      ? microsoftAccount!.signatureOverride
+      : account!.signatureOverride,
+    gmailSignature: useMicrosoft
+      ? null
+      : (accountData as Awaited<ReturnType<typeof decryptAccount>>).signature ?? null,
+  });
 
   const message: MailMessage = {
     fromName: env.SENDER_NAME,

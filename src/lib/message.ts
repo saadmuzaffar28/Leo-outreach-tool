@@ -59,13 +59,39 @@ export function stripHtmlToText(html: string): string {
   return s.replace(/[ \t]+\n/g, "\n").replace(/\n{3,}/g, "\n\n").trim();
 }
 
+/**
+ * Append an account signature to a final email body. This is the ONE shared
+ * injection point every sending provider passes through (Gmail, Outlook, SMTP).
+ *
+ * - `enabled === false`, or no signature provided → body returned unchanged.
+ * - The body already containing the exact signature → returned unchanged, so a
+ *   template that embeds the same signature can never cause a duplicate, and
+ *   retries always produce the same final body.
+ * - Otherwise the signature is appended after `<br>` spacing (the historical
+ *   separator this app has always used between body and signature).
+ */
+export function appendEmailSignature(opts: {
+  html: string;
+  signatureHtml: string | null;
+  enabled?: boolean;
+}): string {
+  const sig = opts.signatureHtml?.trim();
+  const enabled = opts.enabled ?? Boolean(sig);
+  if (!enabled || !sig) return opts.html;
+  if (opts.html.includes(sig)) return opts.html;
+  return `${opts.html}<br>${sig}`;
+}
+
 function plainBody(message: MailMessage): string {
   const text = message.body.replace(/\r\n/g, "\n").replace(/\r/g, "\n");
   const sig =
     message.signatureHtml && message.signatureHtml.trim() !== ""
       ? stripHtmlToText(message.signatureHtml)
       : "";
-  return sig ? `${text}\n\n${sig}` : text;
+  if (!sig) return text;
+  // Never duplicate the signature if the body already carries an identical copy.
+  if (text.includes(sig)) return text;
+  return `${text}\n\n${sig}`;
 }
 
 function htmlBody(message: MailMessage): string {
@@ -73,8 +99,10 @@ function htmlBody(message: MailMessage): string {
     /\n/g,
     "<br>",
   );
-  const sig = message.signatureHtml ?? "";
-  return `<div>${escaped}</div>${sig ? `<br>${sig}` : ""}`;
+  return appendEmailSignature({
+    html: `<div>${escaped}</div>`,
+    signatureHtml: message.signatureHtml ?? null,
+  });
 }
 
 /** Exported for Graph (Microsoft Outlook) sends. */

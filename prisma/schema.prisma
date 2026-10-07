@@ -34,6 +34,8 @@ model User {
   warmupEvents      WarmupEvent[]
   warmupJobs        WarmupJob[]
   warmupMailboxes   WarmupMailboxSettings[]
+  emailVerifications EmailVerification[]
+  verificationJobs   VerificationJob[]
 }
 
 model GoogleAccount {
@@ -110,7 +112,14 @@ model SmtpAccount {
   imapSecurity          String                 @default("ssl")
   imapStatus            String                 @default("unconfigured")
   imapUsernameEncrypted String?
+  signatureEnabled      Boolean                @default(false)
+  signatureHtml         String?
+  /// Per-mailbox sender name shown in the recipient's From header
+  /// (`"Name" <email>`). NULL/empty means "default to the email's local part".
+  displayName           String?
   campaigns             Campaign[]
+  campaignSelections    CampaignSendingAccount[]
+  recipientRuns         CampaignRecipient[]
   user                  User                   @relation(fields: [userId], references: [id], onDelete: Cascade)
   receivedWarmupJobs    WarmupJob[]            @relation("WarmupReceiver")
   sentWarmupJobs        WarmupJob[]            @relation("WarmupSender")
@@ -240,6 +249,11 @@ model Campaign {
   smtpAccountId      String?
   recipientGroupId   String?
   senderName         String?
+  /// Campaign send gate for email verification results.
+  /// OFF | WARN | BLOCK_INVALID | BLOCK_INVALID_AND_RISKY
+  /// Default OFF: campaigns created before this field existed keep their
+  /// exact previous behaviour (no verification check at send time).
+  verificationPolicy String              @default("OFF")
   googleAccount      GoogleAccount?      @relation(fields: [googleAccountId], references: [id])
   microsoftAccount   MicrosoftAccount?   @relation(fields: [microsoftAccountId], references: [id])
   recipientGroup     Group?              @relation(fields: [recipientGroupId], references: [id])
@@ -247,9 +261,30 @@ model Campaign {
   template           EmailTemplate?      @relation(fields: [templateId], references: [id])
   user               User                @relation(fields: [userId], references: [id], onDelete: Cascade)
   recipients         CampaignRecipient[]
+  sendingAccounts    CampaignSendingAccount[]
 
   @@index([userId])
   @@index([status])
+}
+
+// The set of SMTP mailboxes a campaign can send from, in deterministic order.
+// Legacy campaigns that predate multi-mailbox selection have no rows here and
+// keep sending from their single `Campaign.smtpAccountId` exactly as before.
+// New/edited campaigns store the full selection here; `Campaign.smtpAccountId`
+// mirrors the FIRST selected mailbox so existing reads keep working.
+model CampaignSendingAccount {
+  id            String      @id @default(cuid())
+  campaignId    String
+  smtpAccountId String
+  /// 0-based order of the mailbox in the selection (stable, never re-computed).
+  position      Int         @default(0)
+  createdAt     DateTime    @default(now())
+  campaign      Campaign    @relation(fields: [campaignId], references: [id], onDelete: Cascade)
+  smtpAccount   SmtpAccount @relation(fields: [smtpAccountId], references: [id], onDelete: Cascade)
+
+  @@unique([campaignId, smtpAccountId])
+  @@index([campaignId])
+  @@index([smtpAccountId])
 }
 
 model CampaignRecipient {
@@ -269,12 +304,20 @@ model CampaignRecipient {
   isTest          Boolean   @default(false)
   campaign        Campaign  @relation(fields: [campaignId], references: [id], onDelete: Cascade)
   lead            Lead?     @relation(fields: [leadId], references: [id])
+  // The sending mailbox this recipient was ASSIGNED when the campaign started.
+  // Freed once and read forever: retries and worker restarts use this exact
+  // mailbox (and therefore the exact signature), never a re-computed rotation.
+  // null = legacy campaign (sends through Campaign.smtpAccount in the worker)
+  // or a Gmail/Outlook campaign.
+  smtpAccountId   String?
+  smtpAccount     SmtpAccount?  @relation(fields: [smtpAccountId], references: [id], onDelete: SetNull)
 
   @@unique([campaignId, recipient])
   @@index([campaignId])
   @@index([status])
   @@index([recipient])
   @@index([createdAt, id])
+  @@index([smtpAccountId])
 }
 
 model Suppression {
@@ -287,6 +330,138 @@ model Suppression {
 
   @@unique([userId, email])
   @@index([userId])
+}
+
+/// One normalized verification result per address per user â€” doubles as the
+/// verification CACHE: `expiresAt > now()` means the stored result may be
+/// reused without re-running the engine (VERIFICATION_CACHE_TTL_DAYS).
+///
+/// Deliberately a separate history model: Lead/CampaignRecipient rows are
+/// never mutated to store verification data, so a lead can be re-verified or
+/// have several historical checks without touching the campaign pipeline.
+///
+/// status: VALID | INVALID | CATCH_ALL | RISKY | UNKNOWN
+/// "VALID" means likely deliverable â€” never a guarantee of inbox placement.
+model EmailVerification {
+  id                 String   @id @default(cuid())
+  userId             String
+  /// Address as originally submitted (for display).
+  email              String
+  /// Trimmed + lowercased address â€” the cache key (`@@unique` with userId).
+  normalizedEmail    String
+  status             String
+  /// Heuristic 0â€“100 confidence, NOT an ML probability and NOT a delivery guarantee.
+  confidence         Int      @default(0)
+  syntaxValid        Boolean  @default(false)
+  domainValid        Boolean  @default(false)
+  mxValid            Boolean  @default(false)
+  smtpReachable      Boolean  @default(false)
+  catchAll           Boolean  @default(false)
+  disposable         Boolean  @default(false)
+  roleAccount        Boolean  @default(false)
+  freeProvider       Boolean  @default(false)
+  /// Verification engine that produced this row. Only "aftership" today;
+  /// kept as data so results remain interpretable after an engine change.
+  provider           String   @default("aftership")
+  typoSuggestion     String?
+  errorCode          String?
+  errorMessage       String?
+  /// Engine/adapter mapping version that produced `status`/`confidence`.
+  verificationVersion String
+  checkedAt          DateTime @default(now())
+  /// Cache expiry â€” now + VERIFICATION_CACHE_TTL_DAYS at write time.
+  expiresAt          DateTime
+  createdAt          DateTime @default(now())
+  updatedAt          DateTime @updatedAt
+  user               User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  jobs               VerificationJob[]
+
+  @@unique([userId, normalizedEmail])
+  @@index([userId, status])
+  @@index([status])
+  @@index([checkedAt])
+  @@index([expiresAt])
+}
+
+/// One uploaded file that the user has asked to verify ("Verify File").
+///
+/// Created ONLY by POST /api/email-verification/batches — the upload/parse
+/// step itself creates nothing. Creation is the single transactional moment
+/// where this row and its VerificationJob rows come into existence together.
+///
+/// status: pending | running | completed | cancelled | failed
+///
+/// The `*_` counter columns are a materialised view for list screens; the
+/// SOURCE OF TRUTH for progress is always the VerificationJob rows (plus the
+/// EmailVerification rows they link to). Recompute them with
+/// `refreshBatchCounters()` — a single atomic UPDATE that derives every value
+/// from the jobs in one statement, never a read-modify-write increment.
+///
+/// Deliberately no `user User @relation`: userId here is an ownership label
+/// only, while every job it owns still cascades from User. That also means a
+/// batch row alone can never carry a job for a user that does not exist.
+model VerificationBatch {
+  id          String   @id @default(cuid())
+  userId      String
+  /// Original uploaded filename, for the UI and the export name.
+  filename    String
+  total       Int      @default(0)
+  queued      Int      @default(0)
+  running     Int      @default(0)
+  completed   Int      @default(0)
+  valid       Int      @default(0)
+  invalid     Int      @default(0)
+  risky       Int      @default(0)
+  catchAll    Int      @default(0)
+  unknown     Int      @default(0)
+  failed      Int      @default(0)
+  status      String   @default("pending")
+  createdAt   DateTime @default(now())
+  startedAt   DateTime?
+  completedAt DateTime?
+
+  jobs VerificationJob[]
+
+  @@index([userId, createdAt])
+  @@index([userId, status])
+}
+
+/// Background verification queue. Same DB-polling + lease-claim pattern as
+/// CampaignRecipient/WarmupJob â€” no external queue system.
+/// status: queued | processing | done | failed
+model VerificationJob {
+  id              String    @id @default(cuid())
+  userId          String
+  email           String
+  normalizedEmail String
+  status          String    @default("queued")
+  /// Group verification jobs by batch (e.g., CSV filename). Null for
+  /// individually-verified addresses. Used to scope results, export,
+  /// and bulk cancellation to a specific uploaded file.
+  batchId         String?
+  /// Force re-verification even when a fresh cached result exists.
+  force           Boolean   @default(false)
+  attempts        Int       @default(0)
+  nextAttemptAt   DateTime  @default(now())
+  /// Lease expiry: a crashed worker's job becomes reclaimable after this.
+  leaseExpiresAt  DateTime?
+  lastError       String?
+  verificationId  String?
+  createdAt       DateTime  @default(now())
+  updatedAt       DateTime  @updatedAt
+  user            User      @relation(fields: [userId], references: [id], onDelete: Cascade)
+  verification    EmailVerification? @relation(fields: [verificationId], references: [id], onDelete: SetNull)
+  /// NULL for legacy/individually-queued jobs (including every job that
+  /// existed before batches did) — they stay claimable by the normal worker
+  /// exactly as before. A non-null batchId scopes the job to one file-first
+  /// batch, which is only claimable while that batch is "running".
+  batch           VerificationBatch? @relation(fields: [batchId], references: [id], onDelete: SetNull)
+
+  @@index([status, nextAttemptAt])
+  @@index([userId, status])
+  @@index([userId, createdAt])
+  @@index([verificationId])
+  @@index([batchId])
 }
 
 model SmsCampaign {

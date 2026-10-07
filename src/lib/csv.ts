@@ -4,8 +4,8 @@ import { z } from "zod";
 /**
  * Accepted CSV headers, including aliases so common lead-export formats work:
  * a list with `Name, Company Name, Email, Phone` is accepted as-is.
- * Header names are case-insensitive and spaces are treated as underscores
- * (e.g. `Company Name` == `company_name`).
+ * Header names are case-insensitive, spaces are treated as underscores, and
+ * camelCase (e.g. `firstName`, `companyName`) is folded to snake_case.
  */
 export const SUPPORTED_CSV_COLUMNS = [
   "first_name",
@@ -61,7 +61,10 @@ function splitName(raw: string | null): { first: string | null; last: string | n
 }
 
 function normalizeHeader(header: string): string {
-  return header.trim().toLowerCase().replace(/\s+/g, "_");
+  // Fold camelCase ("firstName") to snake_case ("first_name") so headers line
+  // up with the canonical columns regardless of export tool conventions.
+  const snakeCased = header.trim().replace(/([a-z0-9])([A-Z])/g, "$1_$2");
+  return snakeCased.toLowerCase().replace(/\s+/g, "_");
 }
 
 const cell = (value: unknown): string | null => {
@@ -196,6 +199,12 @@ function parseCsvRecord(text: string): { records: Record<string, unknown>[]; lin
 /**
  * Parses raw CSV text into validated lead candidates.
  * Pure function — no database access — so it is unit testable.
+ *
+ * Validation rule for campaign leads: EMAIL IS THE ONLY REQUIRED FIELD.
+ * A row is accepted when its email is present and syntactically valid, even
+ * when every other column (first/last name, company, phone, custom fields)
+ * is empty — those are stored as null/empty rather than rejected or filled
+ * with placeholder values.
  */
 export function parseCsv(text: string, existingEmails: string[] = []): CsvParseResult {
   const globalErrors: string[] = [];
@@ -210,24 +219,22 @@ export function parseCsv(text: string, existingEmails: string[] = []): CsvParseR
     const rawEmail = cell(row["email"]) ?? "";
     const email = rawEmail.toLowerCase();
 
-    // Accept both the canonical columns and the `Name / Company Name` format.
+    // Optional fields only. Name handling accepts both the canonical columns
+    // and the `Name / Company Name` format, but a missing name is NEVER an
+    // error: every non-email column is optional, so absent values are kept
+    // empty rather than rejecting the row or manufacturing a placeholder.
     const explicitFirst = cell(row["first_name"]);
     const explicitLast = cell(row["last_name"]);
     const nameCell = cell(row["name"]) ?? cell(row["full_name"]);
     const { first, last } = splitName(nameCell);
 
     const firstName = explicitFirst ?? first;
-    if (!firstName) {
-      errors.push({
-        path: "first_name",
-        message: "Missing required field: first_name (or name)",
-      });
-    }
-
     const lastName = explicitLast ?? last;
 
     const emailCheck = emailSchema.safeParse(email);
-    if (!emailCheck.success) {
+    if (!rawEmail) {
+      errors.push({ path: "email", message: "Missing email" });
+    } else if (!emailCheck.success) {
       errors.push({ path: "email", message: "Invalid email format" });
     }
 

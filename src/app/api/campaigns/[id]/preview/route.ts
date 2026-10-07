@@ -4,6 +4,9 @@ import { env } from "@/lib/env";
 import { buildRecipientSeeds, estimateDuration } from "@/lib/campaigns";
 import { getSendSettings } from "@/lib/settings";
 import { personalize, PREVIEW_LEAD, validateTemplateContent } from "@/lib/personalization";
+import { coercePolicy, decideGate } from "@/lib/verification/gate";
+import { statusesFor } from "@/lib/verification/service";
+import type { VerificationStatus } from "@/lib/verification/types";
 import { forbidden, jsonResponse, notFound } from "@/lib/http";
 
 export async function GET(_req: Request, { params }: { params: { id: string } }) {
@@ -12,7 +15,13 @@ export async function GET(_req: Request, { params }: { params: { id: string } })
 
   const campaign = await prisma.campaign.findUnique({
     where: { id: params.id },
-    include: { template: true, googleAccount: true, microsoftAccount: true },
+    include: {
+      template: true,
+      googleAccount: true,
+      microsoftAccount: true,
+      smtpAccount: true,
+      sendingAccounts: { include: { smtpAccount: true }, orderBy: { position: "asc" } },
+    },
   });
   if (!campaign || !isOwner(session, campaign.userId)) return notFound("Campaign not found");
 
@@ -40,6 +49,29 @@ export async function GET(_req: Request, { params }: { params: { id: string } })
     suppressedEmails,
   );
 
+  // Pre-flight view of the verification gate — mirrors exactly what the
+  // start route will do, so the operator sees the skips BEFORE starting.
+  const verificationPolicy = coercePolicy(campaign.verificationPolicy);
+  let verificationBlockedCount = 0;
+  let unverifiedCount = 0;
+  if (verificationPolicy !== "OFF" && verificationPolicy !== "WARN") {
+    const verificationRows = await statusesFor(
+      session.sub,
+      seeds.filter((s) => s.status === "pending").map((s) => s.recipient),
+    );
+    for (const seed of seeds) {
+      if (seed.status !== "pending") continue;
+      const row = verificationRows.get(seed.recipient);
+      if (!row) {
+        unverifiedCount++;
+        continue;
+      }
+      if (decideGate(verificationPolicy, row.status as VerificationStatus).block) {
+        verificationBlockedCount++;
+      }
+    }
+  }
+
   const validation = campaign.template
     ? validateTemplateContent(campaign.template.subject, campaign.template.body)
     : { ok: false, errors: ["Select an email template"] };
@@ -51,15 +83,33 @@ export async function GET(_req: Request, { params }: { params: { id: string } })
     body: campaign.template ? personalize(campaign.template.body, PREVIEW_LEAD) : "",
     validation,
     recipientCount: leads.length,
-    validRecipientCount: seeds.filter((s) => s.status === "pending").length,
+    validRecipientCount:
+      seeds.filter((s) => s.status === "pending").length - verificationBlockedCount,
     suppressedCount: seeds.filter((s) => s.status === "skipped").length,
     duplicatesRemoved: leads.length - seeds.length,
+    // Email verification gate (Phase 13) — zero when the policy is OFF/WARN.
+    verificationPolicy,
+    verificationBlockedCount,
+    unverifiedCount,
     googleEmail: campaign.googleAccount?.googleEmail ?? null,
     // Resolved exactly as the worker resolves it, so the pre-flight panel shows
     // the real From display name rather than making the operator guess.
     senderName: campaign.senderName?.trim() || env.SENDER_NAME,
     senderEmail: campaign.googleAccount?.googleEmail ?? campaign.microsoftAccount?.microsoftEmail ?? null,
-    senderProvider: campaign.microsoftAccount ? "microsoft" : campaign.googleAccount ? "google" : null,
+    senderProvider: campaign.smtpAccount
+      ? "smtp"
+      : campaign.microsoftAccount
+        ? "microsoft"
+        : campaign.googleAccount
+          ? "google"
+          : null,
+    // The campaign's selected sending mailboxes, in position order. The client
+    // folds these into the distribution preview via the shared helper.
+    smtpMailboxes: campaign.sendingAccounts.map((s) => ({
+      id: s.smtpAccountId,
+      email: s.smtpAccount?.email ?? null,
+      displayName: s.smtpAccount?.displayName ?? null,
+    })),
     estimatedDuration: estimateDuration(seeds.length, settings.minDelaySeconds),
     sampleRecipients: leads.slice(0, 5).map((l) => l.email),
     sendMode: settings.sendMode,

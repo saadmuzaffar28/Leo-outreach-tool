@@ -66,6 +66,8 @@ export interface DecryptedSmtpAccount {
   security: SmtpSecurity;
   username: string;
   password: string;
+  /** Per-mailbox sender name for the From header; NULL/undefined = local-part fallback. */
+  displayName?: string | null;
 }
 
 /** Classify a thrown nodemailer error into a user-helpful SmtpError. */
@@ -76,8 +78,25 @@ export function classifySmtpError(err: unknown): SmtpError {
   const code = (err as { code?: string } | undefined)?.code ?? "";
   const lower = raw.toLowerCase();
 
-  if (/eauth|535|5\.7\.8|insecure login|authentication|credentials/i.test(raw)) {
-    return new SmtpError("AUTH_FAILED", "SMTP authentication failed. Check the username and password.", err);
+  // Authentication failures. A nodemailer `code` of EAUTH always means the
+  // server rejected the login, even when its message is terse ("Invalid
+  // login."). Google rejects password logins with "534 5.7.14 Please log in
+  // via your web browser and then try again." -- a normal Gmail/Workspace
+  // account password is never accepted over SMTP, so that reply is an auth
+  // failure too, not a configuration mystery, and the message tells the
+  // operator exactly what to do (App Password / OAuth2).
+  if (
+    /eauth/i.test(code) ||
+    /eauth|534|535|5\.7\.8|5\.7\.14|insecure login|authentication|credentials/i.test(raw)
+  ) {
+    const googleBlocked = /5\.7\.14|accounts\.google\.com|signin\/continue/i.test(raw);
+    return new SmtpError(
+      "AUTH_FAILED",
+      googleBlocked
+        ? "SMTP authentication failed: the mail server rejected this login. If this is Gmail or Google Workspace, a normal account password is not accepted over SMTP. Enable 2-Step Verification and use a 16-character App Password, or connect this address with OAuth2 instead."
+        : "SMTP authentication failed. Check the username and password.",
+      err
+    );
   }
   if (/certificate|cert chain|depth_zero|self.signed|unable.to.verify|econstructor|createcipher|invalid protocol|tls|ssl|secure:/i.test(raw) || /SELF_SIGNED_CERT|_CERT_|error:1409/i.test(code)) {
     return new SmtpError("TLS_FAILED", "TLS/SSL negotiation failed. Verify the security mode (SSL vs STARTTLS) and the port.", err);
@@ -201,6 +220,22 @@ export interface SmtpAccountView {
   port: number;
   security: SmtpSecurity;
   /**
+   * Per-account email signature. `signatureEnabled` is the opt-in flag; when it
+   * is false the account sends without a signature. `signatureHtml` is the
+   * sanitized rich-text signature appended to the account's outgoing emails
+   * (campaigns, test sends). Stored separate from body/template so retries can
+   * never duplicate it, and warm-up messages never carry it.
+   */
+  signatureEnabled: boolean;
+  signatureHtml: string | null;
+  /**
+   * Per-mailbox sender name (From-header name). NULL means the sending path
+   * falls back to the email's local part (`lucas@example.com` -> `Lucas`).
+   * Never contains the email address itself: the From ADDRESS always comes
+   * from `email`.
+   */
+  displayName: string | null;
+  /**
    * Stored connection state. Written from several places, so this stays a
    * plain string; the values in use are `connected`, `disconnected`,
    * `auth_failed`, `tls_failed` and `config_invalid`.
@@ -283,6 +318,47 @@ export function sanitizeHeaderValue(value: string): string {
 }
 
 /**
+ * Normalize a user-supplied sender/display name for storage in the database.
+ *
+ * Sender names are user-controlled input that ends up inside a From header.
+ * Control characters — CR, LF, nuls, and the rest of the C0 set — are collapsed
+ * to spaces first (RFC 5322 forbids them in a field body), then the value is
+ * trimmed. The actual RFC 2047 quoting/encoding happens later in nodemailer's
+ * `{ name, address }` address handling, so nothing here ever needs to hand-build
+ * a raw header. Returns null for an empty/whitespace-only value.
+ */
+export function normalizeDisplayName(value: string | null | undefined): string | null {
+  if (value == null) return null;
+  const singleLine = value.replace(/[\r\n\x00-\x1f\x7f]+/g, " ").trim();
+  return singleLine.length > 0 ? singleLine : null;
+}
+
+/**
+ * The sender name that goes into `From: "Name" <email>` for an SMTP mailbox.
+ *
+ * 1. The mailbox's configured `displayName` (sanitized) wins whenever set.
+ * 2. Otherwise the address's LOCAL PART is the fallback, with the leading
+ *    segment capitalized: `lucas@collabrevsolution.org` -> `Lucas`,
+ *    `scott@collabrevsolutions.online` -> `Scott`. Dots/underscores/plus signs
+ *    are treated as separators so `scott.brown@x` steers clear of quoting
+ *    weirdness and reads like a name.
+ *
+ * The email ADDRESS itself is never used as the name, and the returned value is
+ * always single-line (CR/LF removed) so it can never inject a header.
+ */
+export function smtpSenderName(account: { displayName?: string | null; email: string }): string {
+  const configured = normalizeDisplayName(account.displayName);
+  if (configured) return configured;
+
+  const local = (account.email.split("@")[0] ?? "").trim();
+  if (local.length === 0) return account.email;
+
+  const firstSegment = local.split(/[._\-+]+/)[0] || local;
+  const name = firstSegment.charAt(0).toUpperCase() + firstSegment.slice(1);
+  return normalizeDisplayName(name) ?? local;
+}
+
+/**
  * What the SMTP server actually said about a message we handed it.
  *
  * nodemailer returns a rich `SentMessageInfo` after a successful DATA
@@ -343,6 +419,15 @@ export async function sendSmtpMail(
     text?: string;
     replyTo?: string;
     /**
+     * Per-mailbox sender name for the From header. When set, the From is built
+     * as nodemailer's `{ name, address }` object (which RFC 2047-encodes and
+     * quotes the name safely); the ADDRESS is always `account.email`. When
+     * absent the historical single-string `"<email>" <email>` form is used
+     * verbatim — this is what mailbox warm-up sends, and it is deliberately
+     * neutral (no display name), so it must stay byte-for-byte identical.
+     */
+    fromName?: string;
+    /**
      * Extra RFC 5322 headers, as [name, value] pairs. Used by mailbox warm-up to
      * set a deterministic Message-ID and its X-Leo-Warmup-Job correlation header.
      * Campaign sends omit this entirely, so their behaviour is unchanged.
@@ -357,8 +442,14 @@ export async function sendSmtpMail(
       key: sanitizeHeaderValue(key),
       value: sanitizeHeaderValue(value),
     }));
+    // The caller's resolved sender name, single-line already (CR/LF stripped in
+    // smtpSenderName); nodemailer handles all quoting and RFC 2047 encoding.
+    const resolvedName = normalizeDisplayName(msg.fromName ?? undefined);
+    const from = resolvedName
+      ? { name: resolvedName, address: account.email }
+      : `"${account.email.replace(/["\\]/g, "")}" <${account.email}>`;
     const info = await transporter.sendMail({
-      from: `"${account.email.replace(/["\\]/g, "")}" <${account.email}>`,
+      from,
       to: msg.to,
       subject: msg.subject,
       html: msg.html,

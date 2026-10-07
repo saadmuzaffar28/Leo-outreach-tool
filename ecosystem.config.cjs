@@ -1,12 +1,21 @@
 /**
  * PM2 ecosystem for Leo Outreach Tool (Star Billing Outreach)
  *
- * Four processes:
- *   leo-db                 PostgreSQL 18 on 127.0.0.1:5438, supervised by
- *                          scripts/dev-db.mjs (see scripts/lib/pg-supervisor.mjs)
+ * Five processes:
  *   leo-outreach            Next.js production web server on 0.0.0.0:3010
  *   leo-outreach-worker     campaign send-queue worker (one instance only - see README)
  *   leo-outreach-warmup     mailbox warm-up worker (separate from campaigns on purpose)
+ *   leo-outreach-verify     email verification queue worker (AfterShip engine jobs)
+ *   leo-verifier            self-hosted Go verification service (build it first:
+ *                           `npm run verifier:build`; binary at dist/verifier/)
+ *
+ * PostgreSQL is deliberately NOT listed here. It runs as the Windows service
+ * `LeoPostgres` (Session 0, port 5438, data dir
+ * C:\deploy\Leo-outreach-tool.old\.pgdata), owned by the Service Control
+ * Manager. No PM2 process may start, stop or supervise it - the `leo-db` entry
+ * and scripts/dev-db.mjs were removed for that reason, because PM2 -> node.exe
+ * -> postgres.exe put PostgreSQL in the interactive console session and produced
+ * conhost popup windows.
  *
  * NOTE: `npm start` alone would use Next's default port 3000, which is already
  * taken on this host by the existing "COLLAB CRM" app. We therefore invoke the
@@ -19,61 +28,6 @@ const cwd = __dirname;
 
 module.exports = {
   apps: [
-    {
-      // `leo-db` supervises the cluster that every other process depends on, so
-      // its restart policy is deliberately different from the other three.
-      //
-      // The previous policy was autorestart + max_restarts:50 + restart_delay
-      // 5000. Because the old wrapper failed on every attempt (it ran initdb
-      // against a live data directory, then hit `pre-existing shared memory
-      // block is still in use`), that combination produced 51 restart attempts
-      // in roughly 12 minutes before PM2 gave up and left the app definitions
-      // pointing at a dead database. It also left `leo-db` reporting `online`
-      // while PostgreSQL was gone, because nothing verified the postmaster.
-      //
-      // Changes, and why:
-      //   kill_timeout 8000     PM2 previously killed the wrapper almost at once,
-      //                         so the SIGTERM handler that stops PostgreSQL
-      //                         cleanly never got to run.
-      //   min_uptime 30000     A process that dies within 30s of starting is
-      //                         counted as an unstable start, so a genuine
-      //                         "PostgreSQL will not boot" condition cannot burn
-      //                         the whole restart budget in seconds.
-      //   max_restarts 10      Halves the worst case, and each attempt is now
-      //                         idempotent (no duplicate clusters), so ten is
-      //                         plenty.
-      //   restart_delay 10000  Gives PostgreSQL time to flush and shut down.
-      //   exp_backoff_restart_delay 15000
-      //                         PM2 grows the delay geometrically between
-      //                         restarts, so repeated failures stop hammering
-      //                         the port and the data directory.
-      //   env additions        Explicit, documented supervisor knobs. The
-      //                         defaults in scripts/lib/pg-supervisor.mjs are
-      //                         the same values, so a bare `node
-      //                         scripts/dev-db.mjs` behaves identically.
-      name: "leo-db",
-      script: path.join(cwd, "scripts", "dev-db.mjs"),
-      interpreter: NODE_BIN,
-      cwd,
-      env: {
-        NODE_ENV: "production",
-        LEO_DB_PORT: "5438",
-        LEO_DB_START_TIMEOUT_MS: "60000",
-        LEO_DB_HEALTH_INTERVAL_MS: "10000",
-        LEO_DB_STOP_TIMEOUT_MS: "30000",
-        // Startup is a no-op for an existing cluster. Kept explicit so it cannot
-        // be mistaken for permission to reinitialise anything.
-        LEO_DB_ALLOW_INITDB: "0",
-      },
-      autorestart: true,
-      max_restarts: 10,
-      restart_delay: 10000,
-      min_uptime: 30000,
-      exp_backoff_restart_delay: 15000,
-      kill_timeout: 8000,
-      out_file: path.join(cwd, "logs", "leo-db-out.log"),
-      error_file: path.join(cwd, "logs", "leo-db-error.log"),
-    },
     {
       name: "leo-outreach",
       script: path.join(
@@ -123,6 +77,46 @@ module.exports = {
       restart_delay: 5000,
       out_file: path.join(cwd, "logs", "leo-warmup-out.log"),
       error_file: path.join(cwd, "logs", "leo-warmup-error.log"),
+    },
+    {
+      // Email verification queue worker (DB-backed jobs → AfterShip engine).
+      name: "leo-outreach-verify",
+      script: path.join(cwd, "dist", "workers", "scripts", "verification-worker.js"),
+      interpreter: NODE_BIN,
+      cwd,
+      env: {
+        NODE_ENV: "production",
+        DATABASE_URL: "postgresql://postgres:postgres@127.0.0.1:5438/star_billing_outreach?connection_limit=1&sslmode=disable",
+      },
+      autorestart: true,
+      max_restarts: 50,
+      restart_delay: 5000,
+      out_file: path.join(cwd, "logs", "leo-verify-worker-out.log"),
+      error_file: path.join(cwd, "logs", "leo-verify-worker-error.log"),
+    },
+    {
+      // Self-hosted verification service (Go, wraps AfterShip/email-verifier).
+      // Binary must exist first: `npm run verifier:build`.
+      name: "leo-verifier",
+      script: path.join(
+        cwd,
+        "dist",
+        "verifier",
+        process.platform === "win32" ? "email-verifier.exe" : "email-verifier",
+      ),
+      interpreter: "none",
+      cwd,
+      env: {
+        EMAIL_VERIFICATION_LISTEN: "127.0.0.1:8099",
+        EMAIL_VERIFICATION_SMTP_ENABLED: "true",
+        EMAIL_VERIFICATION_TIMEOUT_MS: "15000",
+        EMAIL_VERIFICATION_MAX_INFLIGHT: "4",
+      },
+      autorestart: true,
+      max_restarts: 20,
+      restart_delay: 5000,
+      out_file: path.join(cwd, "logs", "leo-verifier-out.log"),
+      error_file: path.join(cwd, "logs", "leo-verifier-error.log"),
     },
   ],
 };

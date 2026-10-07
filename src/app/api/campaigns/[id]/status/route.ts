@@ -2,8 +2,11 @@ import { prisma } from "@/lib/prisma";
 import { Prisma } from "@prisma/client";
 import { getSession, isOwner } from "@/lib/auth";
 import { campaignActionSchema } from "@/lib/validation";
-import { buildRecipientSeeds } from "@/lib/campaigns";
+import { buildRecipientSeeds, distributeRecipientsAcrossAccounts } from "@/lib/campaigns";
 import { groupLeadWhere } from "@/lib/groups";
+import { coercePolicy, decideGate } from "@/lib/verification/gate";
+import { statusesFor } from "@/lib/verification/service";
+import type { VerificationStatus } from "@/lib/verification/types";
 import { validateTemplateContent } from "@/lib/personalization";
 import { snapshotFromTemplate } from "@/lib/templates";
 import { getSendSettings } from "@/lib/settings";
@@ -42,6 +45,7 @@ export async function POST(req: Request, { params }: { params: { id: string } })
       smtpAccount: true,
       recipientGroup: true,
       recipients: true,
+      sendingAccounts: { orderBy: { position: "asc" } },
     },
   });
 
@@ -146,6 +150,25 @@ export async function POST(req: Request, { params }: { params: { id: string } })
       }
     }
 
+    // Hydrate the multi-mailbox join table for legacy SMTP campaigns: a draft
+    // created before this feature (or one that fell back to the newest mailbox
+    // above) has a single `smtpAccountId` but no `sendingAccounts` rows. The
+    // join table is the canonical selection from here on.
+    if (campaign.smtpAccount && campaign.sendingAccounts.length === 0) {
+      await prisma.campaignSendingAccount.create({
+        data: { campaignId: campaign.id, smtpAccountId: campaign.smtpAccountId!, position: 0 },
+      });
+      campaign.sendingAccounts = [
+        {
+          id: "",
+          createdAt: new Date(),
+          campaignId: campaign.id,
+          smtpAccountId: campaign.smtpAccountId!,
+          position: 0,
+        },
+      ];
+    }
+
     // Fresh recipients on every (re)start, resolved from the campaign's target
     // group (or every lead when no group is set).
     //
@@ -161,9 +184,13 @@ export async function POST(req: Request, { params }: { params: { id: string } })
     // never been emailed" and "we tried to email this person and something
     // happened", and only the second one carries a retry budget that has been
     // partly spent and an outcome that may or may not have reached the provider.
+    // Deterministic lead order: the seed order decides which mailbox each
+    // recipient is assigned to at start, so it must be reproducible across
+    // restarts (`createdAt` alone is not unique — tie-break with the cuid id).
     const [leads, suppressions, alreadySent, attempted] = await Promise.all([
       prisma.lead.findMany({
         where: groupLeadWhere(session.sub, campaign.recipientGroupId),
+        orderBy: [{ createdAt: "asc" }, { id: "asc" }],
       }),
       prisma.suppression.findMany({
         where: { userId: session.sub },
@@ -222,6 +249,35 @@ export async function POST(req: Request, { params }: { params: { id: string } })
       suppressedEmails,
     );
 
+    // Campaign verification gate at seed time (Phase 13). Suppression was
+    // already applied by buildRecipientSeeds ABOVE — only still-pending seeds
+    // can be blocked here, so a suppressed address always keeps its
+    // "Suppressed at campaign start" reason. Policies OFF/WARN change nothing.
+    const verificationPolicy = coercePolicy(campaign.verificationPolicy);
+    let verificationBlockedCount = 0;
+    let unverifiedCount = 0;
+    if (verificationPolicy !== "OFF" && verificationPolicy !== "WARN") {
+      const verificationRows = await statusesFor(
+        session.sub,
+        seeds.filter((s) => s.status === "pending").map((s) => s.recipient),
+      );
+      for (const seed of seeds) {
+        if (seed.status !== "pending") continue;
+        const row = verificationRows.get(seed.recipient);
+        if (!row) {
+          unverifiedCount++;
+          continue;
+        }
+        const gate = decideGate(verificationPolicy, row.status as VerificationStatus);
+        if (gate.block) {
+          // Recorded, never silent: the recipient row states the exact reason.
+          seed.status = "skipped";
+          seed.lastError = gate.reason ?? "verification_blocked";
+          verificationBlockedCount++;
+        }
+      }
+    }
+
     const validCount = seeds.filter(
       (s) => s.status === "pending",
     ).length;
@@ -249,9 +305,11 @@ export async function POST(req: Request, { params }: { params: { id: string } })
       return badRequest(
         attempted.length > 0
           ? "Nothing left to send: every remaining recipient has already been attempted and has no retry left. Starting will not reset their send history."
-          : campaign.recipientGroup
-            ? `No valid recipients in group "${campaign.recipientGroup.name}". Add contacts to the group or remove suppressions first.`
-            : "No valid recipients to send to. Add leads or remove suppressions first.",
+          : verificationBlockedCount > 0
+            ? `Every remaining recipient is blocked by the campaign's email verification policy (${verificationBlockedCount} skipped). Change the policy, or verify/fix the addresses first.`
+            : campaign.recipientGroup
+              ? `No valid recipients in group "${campaign.recipientGroup.name}". Add contacts to the group or remove suppressions first.`
+              : "No valid recipients to send to. Add leads or remove suppressions first.",
       );
     }
 
@@ -268,6 +326,18 @@ export async function POST(req: Request, { params }: { params: { id: string } })
     // Untouched rows are rebuilt exactly as before, so the snapshot semantics
     // (the group is re-read on every start) are unchanged; only rows carrying
     // send history are now exempt.
+    //
+    // THE MAILBOX ASSIGNMENT IS FROZEN HERE, ROW BY ROW. The shared
+    // deterministic distribution assigns each seed to exactly one of the
+    // campaign's selected mailboxes (round-robin by seed index). Once written,
+    // `smtpAccountId` is the recipient's sending mailbox forever — retries and
+    // worker restarts read it, they never re-rotate. Google/Outlook campaigns
+    // have no SMTP selection and stay unchanged (assignment stays NULL and the
+    // worker keeps using the campaign-level account).
+    const selectedSmtpIds = campaign.sendingAccounts.map((s) => s.smtpAccountId);
+    const distribution =
+      selectedSmtpIds.length > 0 ? distributeRecipientsAcrossAccounts(seeds, selectedSmtpIds) : null;
+
     await prisma.$transaction([
       prisma.campaignRecipient.deleteMany({
         where: {
@@ -277,12 +347,13 @@ export async function POST(req: Request, { params }: { params: { id: string } })
         },
       }),
       prisma.campaignRecipient.createMany({
-        data: seeds.map((s) => ({
+        data: seeds.map((s, i) => ({
           campaignId: campaign.id,
           leadId: s.leadId,
           recipient: s.recipient,
           status: s.status,
           lastError: s.lastError,
+          smtpAccountId: distribution ? (distribution.accountByRecipient[i] ?? null) : null,
         })),
       }),
     ]);
@@ -314,6 +385,10 @@ export async function POST(req: Request, { params }: { params: { id: string } })
       // Operator-visible breakdown of what the restart did NOT reset.
       preservedRecipients: attempted.length,
       uncertainRecipients: preservedUncertain,
+      // Verification gate effect at seed time (0 when policy is OFF/WARN).
+      verificationPolicy,
+      verificationBlockedRecipients: verificationBlockedCount,
+      unverifiedRecipients: unverifiedCount,
       estimatedSeconds: queued * settings.minDelaySeconds,
       sendMode: settings.sendMode,
     });

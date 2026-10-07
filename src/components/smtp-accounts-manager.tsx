@@ -3,6 +3,7 @@
 import { useState } from "react";
 import { useRouter } from "next/navigation";
 import { Button, Label, TextInput, Select, Alert, Card } from "@/components/ui";
+import { SmtpSignatureEditor } from "@/components/smtp-signature-editor";
 
 export interface SmtpAccountViewDTO {
   id: string;
@@ -14,6 +15,9 @@ export interface SmtpAccountViewDTO {
   lastTestedAt: string | null;
   lastTestError: string | null;
   createdAt: string;
+  signatureEnabled: boolean;
+  signatureHtml: string | null;
+  displayName: string | null;
 }
 
 export const SMTP_SECURITY_LABELS: Record<string, string> = {
@@ -56,6 +60,8 @@ export function SmtpAccountsManager({ initial }: { initial: SmtpAccountViewDTO[]
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [testingId, setTestingId] = useState<string | null>(null);
+  // Which account's signature editor is expanded (one at a time).
+  const [signatureOpenId, setSignatureOpenId] = useState<string | null>(null);
 
   const [email, setEmail] = useState("");
   const [host, setHost] = useState("");
@@ -66,6 +72,9 @@ export function SmtpAccountsManager({ initial }: { initial: SmtpAccountViewDTO[]
   // Password is NEVER pre-filled and never sent back from the server. On edit,
   // blank means "keep the stored password".
   const [password, setPassword] = useState("");
+  // Per-mailbox sender name that appears in the recipient's From header
+  // ("Name <email>"). Blank means "default to the email's local part".
+  const [senderName, setSenderName] = useState("");
 
   function resetForm() {
     setEmail("");
@@ -74,6 +83,7 @@ export function SmtpAccountsManager({ initial }: { initial: SmtpAccountViewDTO[]
     setSecurity("ssl");
     setUsername("");
     setPassword("");
+    setSenderName("");
     setEditing(null);
   }
 
@@ -85,12 +95,19 @@ export function SmtpAccountsManager({ initial }: { initial: SmtpAccountViewDTO[]
     setSecurity(a.security);
     setUsername("");
     setPassword("");
+    setSenderName(a.displayName ?? "");
   }
 
   async function reload(): Promise<void> {
     const res = await fetch("/api/smtp/accounts");
     const data = (await res.json().catch(() => ({}))) as { accounts?: SmtpAccountViewDTO[] };
     setAccounts(data.accounts ?? []);
+  }
+
+  function updateAccountSignature(id: string, enabled: boolean, html: string | null) {
+    setAccounts((prev) =>
+      prev.map((a) => (a.id === id ? { ...a, signatureEnabled: enabled, signatureHtml: html } : a)),
+    );
   }
 
   async function save(e: React.FormEvent) {
@@ -103,7 +120,15 @@ export function SmtpAccountsManager({ initial }: { initial: SmtpAccountViewDTO[]
       const res = await fetch(url, {
         method,
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ email, host, port: Number(port), security, username, password }),
+        body: JSON.stringify({
+          email,
+          host,
+          port: Number(port),
+          security,
+          username,
+          password,
+          displayName: senderName,
+        }),
       });
       const data = await res.json().catch(() => ({}));
       if (!res.ok) {
@@ -183,6 +208,10 @@ export function SmtpAccountsManager({ initial }: { initial: SmtpAccountViewDTO[]
                   </p>
                   <p className="mt-0.5 text-xs text-slate-400">
                     {a.host}:{a.port} · {SMTP_SECURITY_LABELS[a.security] ?? a.security} · status: {a.status}
+                    {a.signatureEnabled ? " · signature on" : ""}
+                  </p>
+                  <p className="mt-0.5 text-xs text-slate-400">
+                    From name: {a.displayName || "defaults to email local part"}
                   </p>
                   {a.lastTestError ? (
                     <p className="mt-0.5 max-w-[420px] truncate text-xs text-red-500" title={a.lastTestError}>
@@ -202,6 +231,12 @@ export function SmtpAccountsManager({ initial }: { initial: SmtpAccountViewDTO[]
                   >
                     {testingId === a.id ? "Testing…" : "Test connection"}
                   </Button>
+                  <Button
+                    variant="secondary"
+                    onClick={() => setSignatureOpenId(signatureOpenId === a.id ? null : a.id)}
+                  >
+                    {signatureOpenId === a.id ? "Close signature" : "Signature"}
+                  </Button>
                   <Button variant="secondary" onClick={() => startEdit(a)}>
                     Edit
                   </Button>
@@ -210,6 +245,19 @@ export function SmtpAccountsManager({ initial }: { initial: SmtpAccountViewDTO[]
                   </Button>
                 </div>
               </div>
+              {signatureOpenId === a.id ? (
+                <SmtpSignatureEditor
+                  key={a.id}
+                  accountId={a.id}
+                  email={a.email}
+                  initialEnabled={a.signatureEnabled}
+                  initialHtml={a.signatureHtml}
+                  onSaved={(enabled, html) => {
+                    updateAccountSignature(a.id, enabled, html);
+                    router.refresh();
+                  }}
+                />
+              ) : null}
             </li>
           ))}
         </ul>
@@ -281,8 +329,22 @@ export function SmtpAccountsManager({ initial }: { initial: SmtpAccountViewDTO[]
                 required={!editing}
               />
             </div>
+            <div>
+              <Label>Sender name</Label>
+              <TextInput
+                value={senderName}
+                onChange={(e) => setSenderName(e.target.value)}
+                placeholder={editing ? "Lucas" : "Appears in the From header: Lucas <email>"}
+                maxLength={100}
+              />
+            </div>
           </div>
           <p className="mt-2 text-xs text-slate-500">
+            This mailbox displays as &quot;Sender name&quot; &lt;{email || "email"}&gt; in recipients&apos;
+            inboxes. Leave blank to default to the address local part (lucas@… → Lucas). The email
+            address itself is never replaced.
+          </p>
+          <p className="mt-1 text-xs text-slate-500">
             Password is AES-256-GCM-encrypted at rest, only decrypted in memory server-side to send
             or test, and never returned by the API.
           </p>

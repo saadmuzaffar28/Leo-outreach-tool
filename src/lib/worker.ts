@@ -17,11 +17,15 @@ import {
   type DecryptedMicrosoftAccount,
 } from "@/lib/microsoft";
 import type { MailMessage } from "@/lib/message";
-import { buildRawMessage, htmlBody, plainBody, plainTextToHtml } from "@/lib/message";
-import { decryptSmtpCredentials, sendSmtpMail, summarizeSmtpSend, SmtpError, type SmtpSecurity } from "@/lib/smtp";
+import { buildRawMessage, htmlBody, plainBody } from "@/lib/message";
+import { decryptSmtpCredentials, sendSmtpMail, smtpSenderName, summarizeSmtpSend, SmtpError, type SmtpSecurity } from "@/lib/smtp";
 import { buildUnsubscribeUrl, isSuppressed } from "@/lib/suppression";
+import { coercePolicy, decideGate } from "@/lib/verification/gate";
+import { statusesFor } from "@/lib/verification/service";
+import type { VerificationStatus } from "@/lib/verification/types";
 import { personalize } from "@/lib/personalization";
-import { fillSubject } from "@/lib/campaigns";
+import { resolveSignatureForSend } from "@/lib/signature";
+import { fillSubject, pickRecipientSender } from "@/lib/campaigns";
 import { campaignTemplateSource } from "@/lib/templates";
 import { decideSendError, type RetryPolicy } from "@/lib/send-queue";
 import { logSendFailure } from "@/lib/redact";
@@ -98,13 +102,28 @@ async function claimRecipient(id: string, attempts: number, now: Date): Promise<
   return res.count === 1;
 }
 
+/**
+ * Where-clause selecting every campaign tied to a sending account, whether
+ * through the legacy single-account columns (pre-feature campaigns) or through
+ * the multi-mailbox selection join table. Used when an account must pause its
+ * campaigns (daily limit, auth failure).
+ */
+function campaignAccountWhere(provider: SendProvider, accountId: string) {
+  return provider === "smtp"
+    ? {
+        OR: [
+          { smtpAccountId: accountId },
+          { sendingAccounts: { some: { smtpAccountId: accountId } } },
+        ],
+      }
+    : provider === "microsoft"
+      ? { microsoftAccountId: accountId }
+      : { googleAccountId: accountId };
+}
+
 async function pauseCampaignsOnAccount(provider: SendProvider, accountId: string, reason: string): Promise<void> {
-  const field =
-    provider === "smtp" ? "smtpAccountId"
-      : provider === "microsoft" ? "microsoftAccountId"
-        : "googleAccountId";
   await prisma.campaign.updateMany({
-    where: { [field]: accountId, status: "active" },
+    where: { ...campaignAccountWhere(provider, accountId), status: "active" },
     data: { status: "paused", pausedAt: new Date(), pausedReason: reason },
   });
 }
@@ -123,6 +142,7 @@ export async function processDueRecipients(): Promise<number> {
       OR: [{ status: "pending" }, { status: "sending", nextAttemptAt: { lte: now } }],
     },
     include: {
+      smtpAccount: true,
       campaign: { include: { googleAccount: true, microsoftAccount: true, smtpAccount: true, template: true } },
       lead: true,
     },
@@ -148,6 +168,8 @@ export async function processDueRecipients(): Promise<number> {
   // Settings + suppression lists are per-owner; cache within this tick.
   const settingsCache = new Map<string, SendSettingsData>();
   const suppressionCache = new Map<string, ReadonlySet<string>>();
+  // Stored verification results for the gate — one lookup per address per tick.
+  const verificationCache = new Map<string, Promise<VerificationStatus | null>>();
   const runningSent = new Map<string, number>();
   const runningLimits = new Map<string, number>();
   const runningProviders = new Map<string, SendProvider>();
@@ -174,6 +196,19 @@ export async function processDueRecipients(): Promise<number> {
     return set;
   }
 
+  /** Stored verification status for one address (null = never verified). */
+  function storedVerificationStatus(userId: string, email: string): Promise<VerificationStatus | null> {
+    const key = `${userId}|${email.trim().toLowerCase()}`;
+    let pending = verificationCache.get(key);
+    if (!pending) {
+      pending = statusesFor(userId, [email])
+        .then((m) => (m.get(email.trim().toLowerCase())?.status as VerificationStatus | undefined) ?? null)
+        .catch(() => null);
+      verificationCache.set(key, pending);
+    }
+    return pending;
+  }
+
   async function todaySentFor(provider: SendProvider, accountId: string, userId: string): Promise<number> {
     let sent = runningSent.get(accountId);
     if (sent === undefined) {
@@ -187,10 +222,28 @@ export async function processDueRecipients(): Promise<number> {
   let processed = 0;
 
   for (const rec of due) {
-    const smtpAccount = rec.campaign.smtpAccount;
-    const googleAccount = rec.campaign.googleAccount;
-    const microsoftAccount = rec.campaign.microsoftAccount;
-    const provider: SendProvider = smtpAccount ? "smtp" : microsoftAccount ? "microsoft" : "google";
+    // The recipient's FROZEN mailbox assignment — written once when the
+    // campaign started — decides the sender. Retries and worker restarts keep
+    // reading this same row, so a recipient can never silently switch
+    // mailboxes. Campaigns created before multi-mailbox selection existed have
+    // no per-recipient assignment and fall back to the campaign-level account
+    // (Gmail, Outlook, or a single SMTP mailbox), exactly like before.
+    const decided = pickRecipientSender({
+      recipientSmtp: rec.smtpAccount,
+      campaignSmtp: rec.campaign.smtpAccount,
+      campaignMicrosoft: rec.campaign.microsoftAccount,
+      campaignGoogle: rec.campaign.googleAccount,
+    });
+    if (!decided) {
+      await markRecipient(rec.id, { status: "failed", lastError: "No sending account connected to this campaign" });
+      processed++;
+      continue;
+    }
+    const provider: SendProvider = decided.kind;
+    const smtpAccount =
+      provider === "smtp" ? (rec.smtpAccount ?? rec.campaign.smtpAccount) : null;
+    const googleAccount = provider === "google" ? rec.campaign.googleAccount : null;
+    const microsoftAccount = provider === "microsoft" ? rec.campaign.microsoftAccount : null;
     const rawAccount = smtpAccount ?? microsoftAccount ?? googleAccount;
     if (!rawAccount) {
       await markRecipient(rec.id, { status: "failed", lastError: "No sending account connected to this campaign" });
@@ -236,12 +289,30 @@ export async function processDueRecipients(): Promise<number> {
     }
 
     // Suppression list is checked immediately before every send attempt.
+    // Safety rule: suppression ALWAYS wins — verification can never override
+    // an unsubscribe, hard bounce, complaint, or manual block.
     const suppressed = await suppressedFor(rec.campaign.userId);
     if (isSuppressed(rec.recipient, suppressed)) {
       await markRecipient(rec.id, { status: "skipped", lastError: "Suppressed" });
       await incrementDailyCounter(provider, account.id, rec.campaign.userId, { kind: "skipped", count: 1 });
       processed++;
       continue;
+    }
+
+    // Campaign verification gate (policy OFF/WARN = no check at all). This
+    // only reads STORED verification results — an expensive SMTP verification
+    // never runs inside the send path (Phase 15). Skips are recorded, never
+    // silent: lastError states the exact policy reason.
+    const verificationPolicy = coercePolicy(rec.campaign.verificationPolicy);
+    if (verificationPolicy !== "OFF" && verificationPolicy !== "WARN") {
+      const storedStatus = await storedVerificationStatus(rec.campaign.userId, rec.recipient);
+      const gate = decideGate(verificationPolicy, storedStatus);
+      if (gate.block) {
+        await markRecipient(rec.id, { status: "skipped", lastError: gate.reason });
+        await incrementDailyCounter(provider, account.id, rec.campaign.userId, { kind: "skipped", count: 1 });
+        processed++;
+        continue;
+      }
     }
 
     const tpl = campaignTemplateSource(rec.campaign);
@@ -269,16 +340,19 @@ export async function processDueRecipients(): Promise<number> {
     const subject = fillSubject(tpl.subject, values);
     const body = personalize(tpl.body, values);
 
-    // Signature: template override wins, then the account's custom override,
-    // then the signature captured from the connected account (Gmail only).
-    let signatureHtml: string | null = null;
-    if (tpl.useSignature) {
-      signatureHtml = tpl.signatureOverride
-        ? plainTextToHtml(tpl.signatureOverride)
-        : account.signatureOverride
-          ? plainTextToHtml(account.signatureOverride)
-          : googleAccountData?.signature ?? null;
-    }
+    // Signature: one shared resolution used by every sending path. Template
+    // override wins, then the sending account's own rich signature (SMTP), then
+    // the legacy account override, then the signature captured from Gmail. The
+    // account attached to THIS campaign decides — so if a campaign is re-pointed
+    // at a different mailbox, that mailbox's signature is what ships.
+    const signatureHtml = resolveSignatureForSend({
+      templateUseSignature: tpl.useSignature,
+      templateOverride: tpl.signatureOverride || null,
+      accountSignatureEnabled: provider === "smtp" ? Boolean(smtpAccount?.signatureEnabled) : false,
+      accountSignatureHtml: provider === "smtp" ? smtpAccount?.signatureHtml ?? null : null,
+      accountOverride: account.signatureOverride,
+      gmailSignature: provider === "google" ? googleAccountData?.signature ?? null : null,
+    });
 
     const fromEmail =
       provider === "smtp"
@@ -287,11 +361,20 @@ export async function processDueRecipients(): Promise<number> {
           ? microsoftAccountData!.microsoftEmail
           : googleAccountData!.googleEmail;
 
-    // Per-campaign display name, falling back to the global SENDER_NAME when the
-    // campaign has none (all campaigns created before this field existed). The
-    // From ADDRESS is still derived from the selected sending account above, so a
-    // custom display name can never spoof a different sender address.
-    const fromName = rec.campaign.senderName?.trim() || env.SENDER_NAME;
+    // The From NAME is decided by the same account that is sending:
+    //   - SMTP  -> the per-mailbox display name (fallback: the email's local
+    //              part, e.g. lucas@ -> Lucas). Never the campaign name, the
+    //              campaign creator's name, or a global SENDER_NAME — the
+    //              recipient's From must match the mailbox that actually
+    //              authenticates the send, together with its signature.
+    //   - Gmail / Outlook -> the campaign-level display name (falling back to
+    //              the global SENDER_NAME), unchanged from before this feature.
+    // The From ADDRESS is always the selected account's own address below, so a
+    // display name can never spoof a different sender address.
+    const fromName =
+      provider === "smtp"
+        ? smtpSenderName(smtpAccount!)
+        : rec.campaign.senderName?.trim() || env.SENDER_NAME;
 
     const message: MailMessage = {
       fromName,
@@ -399,7 +482,13 @@ export async function processDueRecipients(): Promise<number> {
             username: dec.username,
             password: dec.password,
           },
-          { to: message.to, subject, html: htmlBody(message), text: plainBody(message) },
+          {
+            to: message.to,
+            subject,
+            html: htmlBody(message),
+            text: plainBody(message),
+            fromName: message.fromName,
+          },
         );
         // Record what the server said, not merely that we did not throw.
         //
@@ -513,10 +602,6 @@ async function handleError(
 
   if (decision.action === "auth_required") {
     await markRecipient(recipientId, { status: "failed", lastError: decision.message, nextAttemptAt: null });
-    const field =
-      provider === "smtp" ? "smtpAccountId"
-        : provider === "microsoft" ? "microsoftAccountId"
-          : "googleAccountId";
     // Flag ONLY this account as needing reauthorization, so one revoked grant
     // does not put every other connected Gmail account into the same state.
     if (provider === "google") {
@@ -526,7 +611,7 @@ async function handleError(
       });
     }
     await prisma.campaign.updateMany({
-      where: { [field]: accountId, status: "active" },
+      where: { ...campaignAccountWhere(provider, accountId), status: "active" },
       data: {
         status: "paused",
         pausedAt: new Date(),

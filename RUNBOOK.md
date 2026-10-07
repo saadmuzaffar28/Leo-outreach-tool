@@ -3,7 +3,7 @@
 **Install dir:** `C:\deploy\Leo-outreach-tool`
 **URL:** https://res-subjective-labeled-come.trycloudflare.com  (Cloudflare Quick Tunnel — temporary, changes on tunnel restart)
 **Local:** http://localhost:3010  (LAN: http://192.168.1.4:3010 — login blocked by design, see §7)
-**Stack:** Next.js 14.2.35 (App Router) + Prisma 5.22 + PostgreSQL 18.4 (embedded)
+**Stack:** Next.js 14.2.35 (App Router) + Prisma 5.22 + PostgreSQL 18.4 (Windows service `LeoPostgres`)
 **Managed by:** PM2 7.0.4
 
 > This is a **Windows 11 Pro** host, not Linux. There is no `/var/www`, no
@@ -12,23 +12,47 @@
 
 ---
 
-## 1. The three PM2 processes
+## 1. Process architecture
+
+**PostgreSQL is not a PM2 process.** It runs as the Windows service
+`LeoPostgres` — Session 0, port 5438, data dir
+`C:\deploy\Leo-outreach-tool.old\.pgdata`, account `NT AUTHORITY\NetworkService`,
+owned by the Service Control Manager. PM2 manages only the three application
+processes:
 
 | PM2 name             | What it is                    | Binds to            |
 |----------------------|-------------------------------|---------------------|
-| `leo-db`             | Embedded PostgreSQL 18.4      | `127.0.0.1:5438` only |
 | `leo-outreach`       | Next.js production web server | `0.0.0.0:3010`      |
 | `leo-outreach-worker`| Send-queue worker (1 only)    | none (no listener)  |
+| `leo-outreach-warmup`| Mailbox warm-up worker        | none (no listener)  |
 
 Defined in `ecosystem.config.cjs`. Logs in `logs\`.
 
-> ### ⚠️ `leo-db` can report "online" while PostgreSQL is dead
+```powershell
+Get-Service LeoPostgres        # read-only status (works unelevated)
+Start-Service LeoPostgres      # requires an elevated shell
+Stop-Service  LeoPostgres      # requires an elevated shell
+Get-NetTCPConnection -LocalPort 5438 -State Listen
+```
+
+> Never start PostgreSQL with `node scripts/dev-db.mjs`, `pm2 start leo-db` or
+> any other launcher. The `leo-db` PM2 entry, `scripts/dev-db.mjs` and
+> `scripts/lib/pg-supervisor.mjs` were removed on 2026-10-06. Running
+> PostgreSQL from PM2 -> node.exe -> postgres.exe puts it in the interactive
+> console session, which is what produced the conhost popup windows and the
+> `0xC000013A` child kills recorded below.
+
+> ### ⚠️ Incident history: `leo-db` reported "online" while PostgreSQL was dead
 >
-> Do not trust `pm2 list` for the database. `scripts\dev-db.mjs` calls
-> `pg.start()` **once** and then just parks on a `setInterval` — it never
-> watches the `postgres.exe` child. If PostgreSQL dies, the wrapper stays alive,
-> PM2 keeps showing `online`, and nothing restarts it. The app then fails with
-> `Can't reach database server at localhost:5438` and the worker crash-loops.
+> *(Kept as history — this describes the architecture that has since been
+> replaced. Do not follow the `pm2 restart leo-db` advice below; use
+> `Start-Service LeoPostgres`.)*
+>
+> The old `scripts\dev-db.mjs` called `pg.start()` **once** and then parked on
+> a `setInterval` — it never watched the `postgres.exe` child. If PostgreSQL
+> died, the wrapper stayed alive, PM2 kept showing `online`, and nothing
+> restarted it. The app then failed with
+> `Can't reach database server at localhost:5438` and the worker crash-looped.
 >
 > **Check the database itself, not the process status:**
 >
@@ -37,9 +61,11 @@ Defined in `ecosystem.config.cjs`. Logs in `logs\`.
 > Get-NetTCPConnection -LocalPort 5438 -State Listen -ErrorAction SilentlyContinue
 > ```
 >
-> **Recover:** `pm2 restart leo-db`, then confirm a listening socket and
-> `LOG: database system is ready to accept connections` in `logs\leo-db-out.log`.
-> PostgreSQL replays WAL on start, so committed data is safe; no restore needed.
+> **Recover (as of 2026-10-06):** `Start-Service LeoPostgres` from an elevated
+> shell — `pm2 restart leo-db` no longer exists. Then confirm a listening
+> socket and `LOG: database system is ready to accept connections` in the
+> service log. PostgreSQL replays WAL on start, so committed data is safe; no
+> restore needed.
 > The worker and web app reconnect on their own once the port is back — no
 > restart of those is required.
 >
@@ -68,9 +94,12 @@ Defined in `ecosystem.config.cjs`. Logs in `logs\`.
 > 4689) is disabled, so no kill trace could be captured. Enabling process
 > termination auditing is the next diagnostic step if this recurs.
 >
-> **Recommended permanent fix:** have `dev-db.mjs` watch the `postgres.exe`
-> child and `process.exit(1)` if it dies, so PM2's `autorestart` actually
-> engages. Not implemented — this was live-incident recovery only.
+> **Permanent fix — implemented 2026-10-06:** PostgreSQL was moved out of PM2
+> entirely and now runs as the Windows service `LeoPostgres` in Session 0. A
+> service is started and supervised by the Service Control Manager, so there is
+> no console session for a Ctrl+C to travel down, and no node wrapper that can
+> report `online` over a dead server. `sc failure` is configured to restart it
+> after 5s / 15s / 60s. See §6.
 
 ## 2. Common commands
 
@@ -112,7 +141,8 @@ Defined in `ecosystem.config.cjs`. Logs in `logs\`.
 > pm2 restart leo-outreach        # the web app only
 > ```
 >
-> Do **not** restart the worker for this, and never `cloudflared` / `leo-db`.
+> Do **not** restart the worker for this, and never `cloudflared` or
+> `LeoPostgres` — the database is a Windows service, not a PM2 app.
 >
 > **The LAN entry is a DHCP address and can go stale.** If the router hands this
 > PC a different IP after a reconnect, saves from your phone will 403 again.
@@ -160,21 +190,27 @@ cd C:\deploy\Leo-outreach-tool
 pm2 list                 # status of all three
 pm2 logs leo-outreach    # tail web logs
 pm2 logs leo-outreach-worker
-pm2 logs leo-db
+pm2 logs leo-outreach-warmup
 pm2 restart leo-outreach          # restart just the web app
 pm2 restart leo-outreach-worker   # restart just the worker
-pm2 restart leo-db                # restart the database
 pm2 restart ecosystem.config.cjs  # restart all three
 pm2 stop ecosystem.config.cjs     # stop all three
 pm2 save                          # persist the list (do this after changes)
 pm2 resurrect                     # bring back everything after a crash
+
+Get-Service LeoPostgres           # database status (never `pm2 ... leo-db`)
 ```
 
 ## 3. Start order matters
 
-The worker and the web app both need the database. If the DB is down they will
-crash-loop until it is back (PM2 retries 50 times with a 5 s delay). Always
-restart `leo-db` first.
+The worker, warm-up and web processes all need the database, and PostgreSQL is
+a Windows service rather than a PM2 app, so **PM2 cannot start it for you**.
+Start the service first:
+
+```powershell
+Start-Service LeoPostgres         # elevated shell
+pm2 start ecosystem.config.cjs    # then the three application processes
+```
 
 ## 4. Auto-start after reboot
 
@@ -216,21 +252,31 @@ npx prisma migrate status     # check
 
 ## 6. Database
 
-* Server: PostgreSQL 18.4 via `embedded-postgres` (`node scripts/dev-db.mjs`).
-* Data directory: `C:\deploy\Leo-outreach-tool\.pgdata` — **back this up.**
+* Server: PostgreSQL 18.4 running as the **Windows service `LeoPostgres`**
+  (Session 0, port 5438, account `NT AUTHORITY\NetworkService`).
+* Data directory: `C:\deploy\Leo-outreach-tool.old\.pgdata` — **back this up.**
+  The service's `binPath` points here; the fresh clone has no `.pgdata`.
+* Independent backup: `C:\deploy\Leo-outreach-pgdata-backup` (1792 files,
+  78,790,535 bytes — byte-identical to the live cluster as of 2026-10-06).
 * Database `star_billing_outreach`, user `postgres`, password `postgres`.
-* It was recreated with `ENCODING 'UTF8'`; `embedded-postgres` otherwise creates
-  the cluster in the machine locale (WIN1252 here) and non-Latin1 text fails.
-* `DATABASE_URL` is only in `.env`; Postgres itself has no external exposure
-  because it binds to `::1` only.
+* It was created with `ENCODING 'UTF8'`; the old embedded build otherwise
+  created clusters in the machine locale (WIN1252 here) and non-Latin1 text
+  fails.
+* `DATABASE_URL` is only in `.env`. Remote connections are refused — `pg_hba`
+  requires `host all all 127.0.0.1/32 password`, i.e. local only, with a
+  password.
+* The service binaries live in
+  `C:\deploy\Leo-outreach-tool.old\node_modules\@embedded-postgres\windows-x64\native\bin`
+  (`postgres.exe`, `pg_ctl.exe`, `initdb.exe`). The fresh clone's `node_modules`
+  copy exists only for the throwaway **test** clusters.
 
 To back up:
 
-> The embedded PostgreSQL build ships only `initdb.exe`, `pg_ctl.exe` and
-> `postgres.exe` — **there is no `pg_dump.exe`**. Any `pg_dump` command you
-> find online will fail on this host. Back up either by copying `.pgdata` while
-> `leo-db` is stopped, or with a logical export. This is what was used before
-> the Groups migration:
+> That build ships only `initdb.exe`, `pg_ctl.exe` and `postgres.exe` — **there
+> is no `pg_dump.exe`**. Any `pg_dump` command you find online will fail on this
+> host. Back up either by copying the data directory while the service is
+> stopped, or with a logical export. This is what was used before the Groups
+> migration:
 
 ```powershell
 # Logical export, with encrypted OAuth tokens redacted.
@@ -238,10 +284,12 @@ To back up:
 ```
 
 ```powershell
-# Or a physical copy: stop the DB first so the copy is consistent.
-pm2 stop leo-db
-Copy-Item -Recurse .pgdata "C:\backup\pgdata-$(Get-Date -Format yyyyMMdd-HHmmss)"
-pm2 start leo-db
+# Or a physical copy: stop the SERVICE first so the copy is consistent.
+# (elevated shell - and never `pm2 stop leo-db`, that app no longer exists)
+Stop-Service LeoPostgres
+Copy-Item -Recurse C:\deploy\Leo-outreach-tool.old\.pgdata `
+  "C:\backup\pgdata-$(Get-Date -Format yyyyMMdd-HHmmss)"
+Start-Service LeoPostgres
 ```
 
 ## 7. Configuration notes

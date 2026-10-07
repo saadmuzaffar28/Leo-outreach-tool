@@ -17,6 +17,7 @@
   "include": [
     "scripts/worker.ts",
     "scripts/warmup-worker.ts",
+    "scripts/verification-worker.ts",
     "src/lib/**/*.ts"
   ],
   "exclude": ["node_modules", ".next", "dist", "tests"]

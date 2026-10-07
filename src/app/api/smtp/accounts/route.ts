@@ -5,6 +5,7 @@ import {
   decryptSmtpCredentials,
   describeSmtpFailure,
   encryptSmtpCredentials,
+  normalizeDisplayName,
   SmtpError,
   testSmtpConnection,
   type SmtpAccountView,
@@ -27,6 +28,9 @@ function toView(row: {
   lastTestedAt: Date | null;
   lastTestError: string | null;
   createdAt: Date;
+  signatureEnabled: boolean;
+  signatureHtml: string | null;
+  displayName: string | null;
 }): SmtpAccountView {
   return {
     id: row.id,
@@ -38,6 +42,9 @@ function toView(row: {
     lastTestedAt: row.lastTestedAt,
     lastTestError: row.lastTestError,
     createdAt: row.createdAt,
+    signatureEnabled: row.signatureEnabled,
+    signatureHtml: row.signatureHtml,
+    displayName: row.displayName,
   };
 }
 
@@ -73,6 +80,8 @@ export async function POST(req: Request) {
   const security = (String(b.security ?? "ssl") as SmtpSecurity).trim() as SmtpSecurity;
   const username = String(b.username ?? email).trim();
   const password = String(b.password ?? "");
+  // Optional per-mailbox sender name; sanitized (single-line) at the boundary.
+  const displayName = normalizeDisplayName(b.displayName == null ? null : String(b.displayName));
 
   if (!email || !host || !password) {
     return badRequest("email, host and password are required");
@@ -111,6 +120,7 @@ export async function POST(req: Request) {
       security,
       usernameEncrypted: enc.usernameEncrypted,
       passwordEncrypted: enc.passwordEncrypted,
+      displayName,
       status: "connected",
       lastTestedAt: new Date(),
       lastTestError: null,

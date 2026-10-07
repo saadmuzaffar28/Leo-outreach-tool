@@ -1,5 +1,14 @@
 # Star Billing Outreach - one-click dev environment launcher.
-# Starts the embedded Postgres DB, the Next.js app, and the send worker (only if not already running), then opens the browser.
+# Verifies the PostgreSQL Windows service (LeoPostgres) is up, then starts the
+# Next.js dev app and the send worker if they are not already running, and
+# opens the browser.
+#
+# PostgreSQL is NEVER launched from this script. It is owned by the Service
+# Control Manager (service `LeoPostgres`, Session 0, port 5438). Spawning it
+# from a launcher puts postgres.exe in the interactive console session - the
+# exact architecture that produced the conhost popup windows. Production does
+# not use this script either: it runs the three apps under PM2 (see
+# ecosystem.config.cjs).
 
 $ErrorActionPreference = "Continue"
 $proj = Split-Path -Parent $PSScriptRoot
@@ -16,23 +25,34 @@ function Get-NodeProcsWith([string]$needle) {
 
 $started = @()
 
-# ---- 1. Embedded PostgreSQL (port 5438) ----
+# ---- 1. PostgreSQL Windows service (LeoPostgres, port 5438) ----
+# The ONLY thing allowed here is to observe the service, and at most to start
+# it. Never `node scripts/dev-db.mjs`: PM2 -> node.exe -> postgres.exe is the
+# popup-producing architecture this migration removed.
 if (Test-PortListening 5438) {
-  Write-Host "[launcher] DB already running on 5438"
+  Write-Host "[launcher] DB already listening on 5438"
 } else {
-  Write-Host "[launcher] starting database..."
-  $proc = Start-Process -FilePath "node.exe" -ArgumentList "scripts/dev-db.mjs" `
-    -WorkingDirectory $proj -WindowStyle Hidden `
-    -RedirectStandardOutput (Join-Path $proj "db.log") `
-    -RedirectStandardError (Join-Path $proj "db.log.err") -PassThru
-  $proc.Id | Out-File -FilePath (Join-Path $proj ".devdb.pid") -Encoding ascii
-  $dbReady = $false
-  for ($i = 0; $i -lt 45; $i++) {
-    Start-Sleep -Milliseconds 1000
-    if (Test-PortListening 5438) { $dbReady = $true; break }
+  $dbSvc = Get-Service -Name "LeoPostgres" -ErrorAction SilentlyContinue
+  if (-not $dbSvc) {
+    Write-Host "[launcher] ERROR: Windows service 'LeoPostgres' is not installed."
+    Write-Host "[launcher] Install it with scripts\migrate-to-service.ps1 from an elevated shell."
+    Write-Host "[launcher] NOT starting PostgreSQL from this script."
+  } else {
+    Write-Host "[launcher] starting Windows service LeoPostgres..."
+    try {
+      Start-Service -Name "LeoPostgres" -ErrorAction Stop
+      $dbReady = $false
+      for ($i = 0; $i -lt 60; $i++) {
+        Start-Sleep -Milliseconds 1000
+        if (Test-PortListening 5438) { $dbReady = $true; break }
+      }
+      if ($dbReady) { Write-Host "[launcher] DB ready (service LeoPostgres)" }
+      else { Write-Host "[launcher] WARNING: LeoPostgres started but 5438 not listening after 60s" }
+    } catch {
+      Write-Host "[launcher] ERROR: could not start LeoPostgres: $($_.Exception.Message)"
+      Write-Host "[launcher] Starting a service needs an elevated shell: Start-Service LeoPostgres"
+    }
   }
-  if (-not $dbReady) { Write-Host "[launcher] WARNING: DB not responding after 45s - check db.log" }
-  else { Write-Host "[launcher] DB ready (pid $($proc.Id))" }
 }
 
 # ---- 2. Next.js dev server (port 3001) ----

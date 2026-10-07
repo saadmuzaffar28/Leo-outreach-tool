@@ -27,7 +27,7 @@ export async function createUser(prisma: PrismaClient, email?: string) {
 export async function createSmtpAccount(
   prisma: PrismaClient,
   userId: string,
-  opts: { email?: string; status?: string; imapHost?: string | null } = {},
+  opts: { email?: string; status?: string; imapHost?: string | null; displayName?: string | null } = {},
 ) {
   const email = opts.email ?? `${uniq("mbox")}@test.example`;
   return prisma.smtpAccount.create({
@@ -40,6 +40,7 @@ export async function createSmtpAccount(
       usernameEncrypted: encrypt(`${email}-user`),
       passwordEncrypted: encrypt("super-secret-password"),
       status: opts.status ?? "connected",
+      displayName: opts.displayName ?? null,
       imapHost: opts.imapHost === undefined ? "imap.test.example" : opts.imapHost,
       imapPort: 993,
       imapSecurity: "ssl",
@@ -183,6 +184,8 @@ export async function createCampaign(
     templateId?: string;
     smtpAccountId?: string;
     groupId?: string;
+    /** Multi-mailbox selection in position order. */
+    sendingAccounts?: Array<{ smtpAccountId: string; position: number }>;
   } = {},
 ) {
   return prisma.campaign.create({
@@ -193,6 +196,9 @@ export async function createCampaign(
       templateId: opts.templateId,
       smtpAccountId: opts.smtpAccountId,
       recipientGroupId: opts.groupId,
+      ...(opts.sendingAccounts && opts.sendingAccounts.length > 0
+        ? { sendingAccounts: { create: opts.sendingAccounts } }
+        : {}),
     },
   });
 }
@@ -209,6 +215,8 @@ export async function createRecipients(
     createdAt?: Date;
     lastError?: string;
     nextAttemptAt?: Date | null;
+    /** Frozen sending mailbox assignment (multi-mailbox campaigns). */
+    smtpAccountId?: string;
   }>,
 ) {
   await prisma.campaignRecipient.createMany({
@@ -220,6 +228,7 @@ export async function createRecipients(
       attempts: r.attempts ?? 0,
       lastError: r.lastError,
       nextAttemptAt: r.nextAttemptAt ?? null,
+      smtpAccountId: r.smtpAccountId,
       // An explicit createdAt matters: these tests assert on ORDERING, so the
       // clock must not be what decides it.
       ...(r.createdAt ? { createdAt: r.createdAt } : {}),

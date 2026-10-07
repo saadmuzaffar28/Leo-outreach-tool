@@ -10,6 +10,8 @@ import { DeleteLeadButton } from "@/components/delete-lead-button";
 import { DeleteAllLeadsButton } from "@/components/delete-all-leads-button";
 import { RemoveFromGroupButton } from "@/components/remove-from-group-button";
 import { listGroups, groupLeadWhere } from "@/lib/groups";
+import { VerificationBadge } from "@/components/verification/verification-badge";
+import { statusesFor } from "@/lib/verification/service";
 
 const PAGE_SIZE = 25;
 
@@ -115,6 +117,13 @@ export default async function LeadsPage({ searchParams }: { searchParams: Search
       take: PAGE_SIZE,
     }),
   ]);
+
+  // Stored verification results for this page's addresses (one query). Rows
+  // without a record render as "Unverified" with a per-row Verify button.
+  const verificationMap = await statusesFor(
+    session.sub,
+    leads.map((l) => l.email),
+  );
 
   const totalPages = Math.max(1, Math.ceil(total / PAGE_SIZE));
   // Preserve the group scope across paging/sorting/search.
@@ -223,6 +232,7 @@ export default async function LeadsPage({ searchParams }: { searchParams: Search
                 <tr>
                   <th className="px-6 py-3">Name</th>
                   <th className="px-4 py-3">Email</th>
+                  <th className="px-4 py-3">Verified</th>
                   <th className="px-4 py-3">Practice</th>
                   <th className="px-4 py-3">Phone</th>
                   <th className="px-4 py-3">Custom 1</th>
@@ -238,6 +248,13 @@ export default async function LeadsPage({ searchParams }: { searchParams: Search
                       {l.firstName} {l.lastName ?? ""}
                     </td>
                     <td className="px-4 py-3">{l.email}</td>
+                    <td className="px-4 py-3">
+                      <VerificationBadge
+                        email={l.email}
+                        initialStatus={verificationMap.get(l.email.trim().toLowerCase())?.status ?? null}
+                        initialConfidence={verificationMap.get(l.email.trim().toLowerCase())?.confidence ?? null}
+                      />
+                    </td>
                     <td className="px-4 py-3 text-slate-600">{l.practiceName ?? "—"}</td>
                     <td className="px-4 py-3 text-slate-600">{l.phone ?? "—"}</td>
                     <td className="px-4 py-3 text-slate-600">{l.customField1 ?? "—"}</td>

@@ -44,6 +44,28 @@ const envSchema = z.object({
    * APP_URL itself is always accepted and does not need to be listed here.
    */
   ALLOWED_ORIGINS: z.string().default(""),
+  // -------------------------------------------------------------------------
+  // Email verification (self-hosted AfterShip/email-verifier sidecar).
+  // All values have safe defaults — see .env.example for documentation.
+  // -------------------------------------------------------------------------
+  EMAIL_VERIFICATION_ENABLED: z
+    .string()
+    .default("true")
+    .transform((v) => v === "1" || v.toLowerCase() === "true"),
+  /** Loopback URL of the local Go verification service. */
+  EMAIL_VERIFICATION_SERVICE_URL: z.string().default("http://127.0.0.1:8099"),
+  /** Shared bearer token between the app and the verification service. */
+  EMAIL_VERIFICATION_SERVICE_TOKEN: z.string().default(""),
+  /** Days a stored result stays fresh enough to reuse from cache. */
+  EMAIL_VERIFICATION_CACHE_TTL_DAYS: z.coerce.number().int().min(1).max(365).default(7),
+  /** Max verifications in flight (worker-side). Conservative by default. */
+  EMAIL_VERIFICATION_CONCURRENCY: z.coerce.number().int().min(1).max(50).default(3),
+  /** Whole-request timeout toward the verification service (ms). */
+  EMAIL_VERIFICATION_TIMEOUT_MS: z.coerce.number().int().min(1_000).max(120_000).default(15_000),
+  /** Pause between starting individual verifications (ms) — go easy on MX/SMTP servers. */
+  EMAIL_VERIFICATION_DELAY_MS: z.coerce.number().int().min(0).max(60_000).default(500),
+  /** Max retries for retryable failures (timeouts, 4xx, engine down). */
+  EMAIL_VERIFICATION_MAX_RETRIES: z.coerce.number().int().min(0).max(10).default(2),
 });
 
 function loadEnv() {

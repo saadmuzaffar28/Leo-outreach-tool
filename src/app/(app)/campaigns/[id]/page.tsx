@@ -4,6 +4,7 @@ import { getSession, isOwner } from "@/lib/auth";
 import { prisma } from "@/lib/prisma";
 import { PageHeader, Card, CardHeader, StatusBadge, ButtonLink, EmptyState, Alert } from "@/components/ui";
 import { CampaignActions } from "@/components/campaign-actions";
+import { CampaignSendingMailboxes } from "@/components/campaign-sending-mailboxes";
 import { getSendSettings } from "@/lib/settings";
 import { campaignTemplateName } from "@/lib/templates";
 import { env } from "@/lib/env";
@@ -17,11 +18,18 @@ export default async function CampaignDetailPage({ params }: { params: { id: str
 
   const campaign = await prisma.campaign.findUnique({
     where: { id: params.id },
-    include: { template: true, googleAccount: true, microsoftAccount: true, smtpAccount: true, recipientGroup: true },
+    include: {
+      template: true,
+      googleAccount: true,
+      microsoftAccount: true,
+      smtpAccount: true,
+      recipientGroup: true,
+      sendingAccounts: { include: { smtpAccount: true }, orderBy: { position: "asc" } },
+    },
   });
   if (!campaign || !isOwner(session, campaign.userId)) notFound();
 
-  const [counts, recipients, settings] = await Promise.all([
+  const [counts, recipients, settings, connectedSmtp] = await Promise.all([
     prisma.campaignRecipient.groupBy({
       by: ["status"],
       where: { campaignId: campaign.id },
@@ -30,18 +38,57 @@ export default async function CampaignDetailPage({ params }: { params: { id: str
     prisma.campaignRecipient.findMany({
       where: { campaignId: campaign.id },
       orderBy: { createdAt: "asc" },
-      include: { lead: { select: { firstName: true, lastName: true, practiceName: true } } },
+      include: {
+        lead: { select: { firstName: true, lastName: true, practiceName: true } },
+        smtpAccount: { select: { email: true } },
+      },
     }),
     getSendSettings(session.sub),
+    prisma.smtpAccount.findMany({
+      where: { userId: session.sub, status: "connected" },
+      orderBy: { createdAt: "desc" },
+      select: { id: true, email: true },
+    }),
   ]);
 
   const stats = KEYS.reduce<Record<string, number>>((acc, k) => {
     acc[k] = counts.find((r) => r.status === k)?._count._all ?? 0;
     return acc;
   }, {});
+  // Recipients the verification gate skipped (they carry the stable reason).
+  const verificationBlocked = recipients.filter((r) =>
+    r.lastError?.startsWith("verification_blocked"),
+  ).length;
   // The recipient rows are snapshotted when the campaign starts, so this total
   // is the count that was actually targeted and stays stable afterwards.
   const recipientTotal = recipients.length;
+
+  // Display label for the campaign's sending mailboxes (position order).
+  const mailboxEmails = campaign.sendingAccounts
+    .map((s) => s.smtpAccount?.email ?? null)
+    .filter((e): e is string => Boolean(e));
+  const senderLabel =
+    mailboxEmails.length > 1
+      ? `${mailboxEmails.length} sending mailboxes: ${mailboxEmails.join(", ")}`
+      : mailboxEmails[0] ?? null;
+
+  // Editor list: connected mailboxes + any already-selected mailbox, so a
+  // mailbox that turned unhealthy can still be seen and deselected.
+  const editorMailboxById = new Map<string, string>();
+  for (const a of connectedSmtp) editorMailboxById.set(a.id, a.email);
+  for (const s of campaign.sendingAccounts) {
+    if (!editorMailboxById.has(s.smtpAccountId) && s.smtpAccount?.email) {
+      editorMailboxById.set(s.smtpAccountId, s.smtpAccount.email);
+    }
+  }
+  const mailboxesForEditor = Array.from(editorMailboxById.entries()).map(([id, email]) => ({ id, email }));
+
+  // Message-log fallback: legacy SMTP campaigns have recipients without a
+  // frozen per-recipient mailbox, and send through Campaign.smtpAccount.
+  const legacySmtpEmail =
+    campaign.smtpAccount && !campaign.googleAccount && !campaign.microsoftAccount
+      ? campaign.smtpAccount.email
+      : null;
 
   const workerNeeded =
     campaign.status === "active" &&
@@ -58,9 +105,29 @@ export default async function CampaignDetailPage({ params }: { params: { id: str
       <div className="mb-6 flex flex-wrap items-center gap-3">
         <StatusBadge status={campaign.status} />
         <span className="text-sm text-slate-500">
-          Sending account:{" "}
-          <span className="font-medium text-slate-700">{campaign.googleAccount?.googleEmail ?? campaign.microsoftAccount?.microsoftEmail ?? campaign.smtpAccount?.email ?? "No account"}</span>
+          {campaign.smtpAccount
+            ? mailboxEmails.length > 1
+              ? "Sending mailboxes: "
+              : "Sending mailbox: "
+            : "Sending account: "}
+          <span className="font-medium text-slate-700">
+            {campaign.smtpAccount
+              ? senderLabel ?? campaign.smtpAccount.email
+              : campaign.googleAccount?.googleEmail ??
+                campaign.microsoftAccount?.microsoftEmail ??
+                "No account"}
+          </span>
           {campaign.smtpAccount ? " (SMTP)" : campaign.microsoftAccount ? " (Outlook)" : campaign.googleAccount ? " (Gmail)" : null}
+        </span>
+        <span className="text-sm text-slate-500">
+          Verification gate:{" "}
+          <span className="font-medium text-slate-700">{campaign.verificationPolicy ?? "OFF"}</span>
+          {verificationBlocked > 0 ? (
+            <span className="text-xs text-slate-500">
+              {" "}— {verificationBlocked}{" "}
+              {verificationBlocked === 1 ? "recipient" : "recipients"} skipped by the gate
+            </span>
+          ) : null}
         </span>
         <span className="text-sm text-slate-500">
           Sender name:{" "}
@@ -127,6 +194,14 @@ export default async function CampaignDetailPage({ params }: { params: { id: str
         </div>
       </Card>
 
+      {(campaign.status === "draft" || campaign.status === "stopped") && campaign.smtpAccount ? (
+        <CampaignSendingMailboxes
+          campaignId={campaign.id}
+          mailboxes={mailboxesForEditor}
+          initialSelected={campaign.sendingAccounts.map((s) => s.smtpAccountId)}
+        />
+      ) : null}
+
       <div className="mb-8 grid grid-cols-2 gap-4 md:grid-cols-5">
         <Card className="p-4 text-center">
           <p className="text-2xl font-bold text-slate-900">{KEYS.reduce((a, k) => a + stats[k], 0)}</p>
@@ -164,6 +239,7 @@ export default async function CampaignDetailPage({ params }: { params: { id: str
                 <tr>
                   <th className="px-6 py-3">Recipient</th>
                   <th className="px-4 py-3">Name</th>
+                  <th className="px-4 py-3">Sending mailbox</th>
                   <th className="px-4 py-3">Status</th>
                   <th className="px-4 py-3">Attempts</th>
                   <th className="px-4 py-3">Last error</th>
@@ -178,6 +254,9 @@ export default async function CampaignDetailPage({ params }: { params: { id: str
                       {r.lead
                         ? `${r.lead.firstName} ${r.lead.lastName ?? ""}`.trim()
                         : "—"}
+                    </td>
+                    <td className="px-4 py-3 text-slate-600">
+                      {r.smtpAccount?.email ?? legacySmtpEmail ?? "—"}
                     </td>
                     <td className="px-4 py-3"><StatusBadge status={r.status} /></td>
                     <td className="px-4 py-3 text-slate-500">{r.attempts}</td>

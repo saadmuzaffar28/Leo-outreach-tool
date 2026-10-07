@@ -5,6 +5,7 @@ import {
   decryptSmtpCredentials,
   describeSmtpFailure,
   encryptSmtpCredentials,
+  normalizeDisplayName,
   SmtpError,
   testSmtpConnection,
   type SmtpAccountView,
@@ -24,6 +25,9 @@ function toView(row: {
   lastTestedAt: Date | null;
   lastTestError: string | null;
   createdAt: Date;
+  signatureEnabled: boolean;
+  signatureHtml: string | null;
+  displayName: string | null;
 }): SmtpAccountView {
   return {
     id: row.id,
@@ -35,6 +39,9 @@ function toView(row: {
     lastTestedAt: row.lastTestedAt,
     lastTestError: row.lastTestError,
     createdAt: row.createdAt,
+    signatureEnabled: row.signatureEnabled,
+    signatureHtml: row.signatureHtml,
+    displayName: row.displayName,
   };
 }
 
@@ -86,6 +93,13 @@ export async function PATCH(
   // ciphertext is otherwise preserved so credentials survive a no-op PATCH.
   const password = b.password === undefined ? dec.password : String(b.password);
 
+  // Per-mailbox sender name. A missing field keeps the stored value (so a
+  // displayName-only PATCH never overwrites it with NULL).
+  const displayName =
+    b.displayName === undefined
+      ? row.displayName
+      : normalizeDisplayName(b.displayName == null ? null : String(b.displayName));
+
   if (!email || !host || !password) {
     return badRequest("email, host and password are required");
   }
@@ -93,15 +107,25 @@ export async function PATCH(
     return badRequest("port must be an integer between 1 and 65535");
   }
 
-  try {
-    await testSmtpConnection({ email, username, password, host, port, security });
-  } catch (err) {
-    const smtpErr = err instanceof SmtpError ? err : classifySmtpError(err);
-    const diag = describeSmtpFailure(smtpErr);
-    return jsonResponse(
-      { error: smtpErr.userMessage, code: smtpErr.code, email, host, port, security, ...diag },
-      400
-    );
+  // A live connection test is only needed when the request actually touches how
+  // the mailbox connects (address, host, port, security or credentials). A
+  // displayName-only edit — the "Sender Name" field in the mailbox settings —
+  // is not a connection change, so it must not depend on the network: same
+  // reason the signature route deliberately never re-runs the SMTP verify.
+  const CONNECTION_FIELDS = ["email", "host", "port", "security", "username", "password"] as const;
+  const touchesConnection = CONNECTION_FIELDS.some((key) => key in b);
+
+  if (touchesConnection) {
+    try {
+      await testSmtpConnection({ email, username, password, host, port, security });
+    } catch (err) {
+      const smtpErr = err instanceof SmtpError ? err : classifySmtpError(err);
+      const diag = describeSmtpFailure(smtpErr);
+      return jsonResponse(
+        { error: smtpErr.userMessage, code: smtpErr.code, email, host, port, security, ...diag },
+        400
+      );
+    }
   }
 
   const enc = encryptSmtpCredentials({ email, host, port, security, username, password });
@@ -115,9 +139,12 @@ export async function PATCH(
       security,
       usernameEncrypted: enc.usernameEncrypted,
       passwordEncrypted: enc.passwordEncrypted,
-      status: "connected",
-      lastTestedAt: new Date(),
-      lastTestError: null,
+      displayName,
+      // Only a connection-affecting change re-marks the mailbox connected and
+      // re-stamps lastTestedAt; a displayName-only edit leaves that untouched.
+      ...(touchesConnection
+        ? { status: "connected", lastTestedAt: new Date(), lastTestError: null }
+        : {}),
     },
   });
 

@@ -4,6 +4,7 @@ import { useState } from "react";
 import { useRouter } from "next/navigation";
 import { Button, Alert, Label, Select } from "@/components/ui";
 import { Modal } from "@/components/modal";
+import { distributionCounts } from "@/lib/campaign-distribution";
 
 interface PreviewValidation {
   ok: boolean;
@@ -23,10 +24,11 @@ interface PreviewData {
   googleEmail: string | null;
   senderName: string;
   senderEmail: string | null;
-  senderProvider: "google" | "microsoft" | null;
+  senderProvider: "google" | "microsoft" | "smtp" | null;
   estimatedDuration: string;
   sampleRecipients: string[];
   sendMode?: "live" | "test";
+  smtpMailboxes?: Array<{ id: string; email: string | null; displayName?: string | null }>;
 }
 
 interface TemplateOption {
@@ -214,7 +216,9 @@ export function CampaignActions({ campaignId, status }: { campaignId: string; st
                 <div className="flex justify-between gap-2">
                   <span className="text-slate-500">Sending from</span>
                   <span className="truncate font-semibold text-slate-900">
-                    {preview.senderName} &lt;{preview.senderEmail ?? preview.googleEmail ?? "—"}&gt;
+                    {preview.senderProvider === "smtp"
+                      ? preview.senderName
+                      : `${preview.senderName} <${preview.senderEmail ?? preview.googleEmail ?? "—"}>`}
                   </span>
                 </div>
                 <div className="mt-1 flex justify-between">
@@ -231,6 +235,51 @@ export function CampaignActions({ campaignId, status }: { campaignId: string; st
                 </div>
               </div>
             </div>
+
+            {preview.senderProvider === "smtp" &&
+            preview.smtpMailboxes &&
+            preview.smtpMailboxes.length > 0 ? (
+              <div className="rounded-lg border border-slate-100 bg-slate-50 p-3 text-sm">
+                <p className="mb-2 flex items-center justify-between gap-2">
+                  <span className="text-slate-500">
+                    Sending mailboxes ({preview.smtpMailboxes.length})
+                  </span>
+                  <span className="font-semibold text-slate-900">
+                    {preview.recipientCount} {preview.recipientCount === 1 ? "contact" : "contacts"}
+                  </span>
+                </p>
+                <ul className="space-y-1">
+                  {distributionCounts(
+                    preview.recipientCount,
+                    preview.smtpMailboxes.map((m) => m.id),
+                  ).map((c) => (
+                    <li
+                      key={c.smtpAccountId}
+                      className="flex items-center justify-between gap-3 text-slate-600"
+                    >
+                      <span className="truncate">
+                        {(() => {
+                          const m = preview.smtpMailboxes?.find(
+                            (mb) => mb.id === c.smtpAccountId,
+                          );
+                          const label = m?.displayName
+                            ? `${m.displayName} — ${m.email}`
+                            : (m?.email ?? c.smtpAccountId);
+                          return label;
+                        })()}
+                      </span>
+                      <span className="font-semibold text-slate-900">
+                        {c.count} {c.count === 1 ? "contact" : "contacts"}
+                      </span>
+                    </li>
+                  ))}
+                </ul>
+                <p className="mt-2 text-xs text-slate-400">
+                  Each mailbox sends only its assigned contacts and appends its
+                  own signature.
+                </p>
+              </div>
+            ) : null}
 
             {preview.sampleRecipients.length > 0 ? (
               <div>
