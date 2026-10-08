@@ -83,6 +83,15 @@ export async function POST(req: Request) {
   const parsed = campaignCreateSchema.safeParse(body);
   if (!parsed.success) return badRequest(parsed.error.issues[0]?.message ?? "Invalid campaign");
 
+  // Single-group contract: a campaign targets EXACTLY ONE group. A plural
+  // `recipientGroupIds` is not a supported field and must never be silently
+  // dropped (zod strips unknown keys) — ignoring it would fall back to
+  // "every lead" and blast the whole contact list. Reject it loudly.
+  const rawBody = body as Record<string, unknown> | null;
+  if (rawBody && Array.isArray(rawBody.recipientGroupIds) && !parsed.data.recipientGroupId) {
+    return badRequest("Select exactly one group: send recipientGroupId (a single group id), not recipientGroupIds.");
+  }
+
   // Multi-mailbox selection (1..N connected SMTP mailboxes). The legacy
   // single-account fields keep working: `smtpAccountId` is treated as a
   // one-element selection, and Gmail/Outlook campaigns are unchanged.

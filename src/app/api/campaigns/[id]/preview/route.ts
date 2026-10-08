@@ -4,6 +4,7 @@ import { env } from "@/lib/env";
 import { buildRecipientSeeds, estimateDuration } from "@/lib/campaigns";
 import { getSendSettings } from "@/lib/settings";
 import { personalize, PREVIEW_LEAD, validateTemplateContent } from "@/lib/personalization";
+import { groupLeadWhere } from "@/lib/groups";
 import { coercePolicy, decideGate } from "@/lib/verification/gate";
 import { statusesFor } from "@/lib/verification/service";
 import type { VerificationStatus } from "@/lib/verification/types";
@@ -26,8 +27,12 @@ export async function GET(_req: Request, { params }: { params: { id: string } })
   if (!campaign || !isOwner(session, campaign.userId)) return notFound("Campaign not found");
 
   const [leads, suppressions, settings] = await Promise.all([
+    // The campaign's audience is its selected group (or every lead when no
+    // group was chosen) — NEVER all of the user's leads. This must mirror the
+    // start route's seeding exactly, or a grouped campaign would preview the
+    // wrong recipient count. See status/route.ts (same `groupLeadWhere`).
     prisma.lead.findMany({
-      where: { userId: session.sub },
+      where: groupLeadWhere(session.sub, campaign.recipientGroupId),
       orderBy: { createdAt: "desc" },
     }),
     prisma.suppression.findMany({
