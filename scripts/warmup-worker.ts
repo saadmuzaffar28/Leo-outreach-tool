@@ -1,4 +1,5 @@
 import "dotenv/config";
+import "./worker-alias";
 import { runWarmupWorker } from "../src/lib/warmup/worker";
 
 /**

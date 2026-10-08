@@ -249,6 +249,146 @@ describe("POST /api/email-verification/batches — creation", () => {
 
 // ---------------------------------------------------------------------------
 
+describe("production CSV shape — extra columns must never touch verification", () => {
+  // The exact header of COLLAB_REV_BATCH_2_formatted.csv, the file that
+  // produced the 99/99 failure incident. Only the Email column may be
+  // verified; names, phone numbers and custom fields must be ignored by the
+  // parser and never become jobs.
+  const CSV_HEADER = "Name,Company Name,Email,Phone,first_name,last_name,custom_field_1,custom_field_2";
+
+  it("parses only the Email column out of the 8-column file", async () => {
+    const csvText = [
+      CSV_HEADER,
+      'Gardner Family Dentistry,Gardner Family Dentistry,info@gardnerfamilydentistry.com,(334) 821-8755,Candice,Summerford,office manager,Huntsville, Alabama',
+      'DDS Arizona,75th & DDS,75th@ddsarizona.com,(602) 555-0199,John,Doe,appointment coordinator,Phoenix, Arizona',
+      'Simply Smiles,Arrowhead, support@simplysmilesarrowhead.com, (623) 555-0144, Jane, Smith, front desk, Peoria, Arizona',
+    ].join("\n");
+
+    const parsed = parseEmailList(csvText);
+    expect(parsed.emails).toEqual([
+      "info@gardnerfamilydentistry.com",
+      "75th@ddsarizona.com",
+      "support@simplysmilesarrowhead.com",
+    ]);
+    expect(parsed.invalid).toBeGreaterThan(0); // names/phones/fields were rejected, not verified
+  });
+
+  it("extra columns never become verification jobs end-to-end", async () => {
+    authed(ownerId);
+    const csvText = [
+      CSV_HEADER,
+      'Gardner Family Dentistry,Gardner Family Dentistry,info@gardnerfamilydentistry.com,(334) 821-8755,Candice,Summerford,office manager,Huntsville, Alabama',
+      'DDS Arizona,75th & DDS,75th@ddsarizona.com,(602) 555-0199,John,Doe,appointment coordinator,Phoenix, Arizona',
+    ].join("\n");
+
+    const parsed = parseEmailList(csvText);
+    const batchId = await createBatch(parsed.emails, "COLLAB_REV_BATCH_2_formatted.csv");
+
+    const jobs = await prisma.verificationJob.findMany({ where: { batchId } });
+    expect(jobs).toHaveLength(2);
+    expect(new Set(jobs.map((j) => j.normalizedEmail))).toEqual(
+      new Set(["info@gardnerfamilydentistry.com", "75th@ddsarizona.com"]),
+    );
+    // No name/phone/custom-field cell was ever minted as a job.
+    for (const cell of ["(334)", "candice", "summerford", "office", "huntsville"]) {
+      expect(jobs.some((j) => j.email.toLowerCase().includes(cell))).toBe(false);
+    }
+  });
+});
+
+// ---------------------------------------------------------------------------
+
+describe("incident reproduction — engine unavailable then recovered (99 jobs)", () => {
+  /** 99 distinct addresses, shaped like the incident file. */
+  function ninetyNineEmails(): string[] {
+    return Array.from({ length: 99 }, (_, i) => `lead-${String(i + 1).padStart(3, "0")}@clinic-${i}.example`);
+  }
+
+  it(
+    "sidecar down ⇒ 99/99 fail with the real error and zero verified counts; " +
+      "sidecar up ⇒ a re-upload of the same file completes 99/99 with stored results",
+    async () => {
+      authed(ownerId);
+      const emails = ninetyNineEmails();
+
+      // ---- Incident half: the verifier sidecar is not answering. ----
+      verifyAndNormalize.mockResolvedValue({
+        ok: false,
+        errorCode: "service_unavailable",
+        errorMessage: "Verification engine is unavailable",
+        retryable: true,
+      });
+      const failedBatchId = await createBatch(emails, "COLLAB_REV_BATCH_2_formatted.csv");
+      const started = await json(await startBatch(failedBatchId));
+      expect(started.batch.status).toBe("running");
+
+      const { runBatchWorker } = await import("@/lib/verification/worker");
+      expect(await runBatchWorker(failedBatchId)).toBe("completed");
+
+      const failed = await prisma.verificationBatch.findUnique({ where: { id: failedBatchId } });
+      expect(failed).toMatchObject({
+        status: "completed",
+        total: 99,
+        queued: 0,
+        running: 0,
+        completed: 99, // every job reached a terminal state
+        failed: 99,
+        valid: 0,
+        invalid: 0,
+        risky: 0,
+        catchAll: 0,
+        unknown: 0,
+      });
+
+      const failedJobs = await prisma.verificationJob.findMany({ where: { batchId: failedBatchId } });
+      expect(failedJobs).toHaveLength(99);
+      for (const job of failedJobs) {
+        expect(job.status).toBe("failed");
+        expect(job.verificationId).toBeNull(); // nothing was stored
+        expect(job.attempts).toBe(3); // 1 + EMAIL_VERIFICATION_MAX_RETRIES(2)
+        expect(job.lastError).toContain("Verification engine is unavailable");
+      }
+      // Failed jobs must not appear as checked/valid/invalid/... anywhere.
+      expect(await prisma.emailVerification.count({ where: { userId: ownerId } })).toBe(0);
+
+      // ---- Recovery half: the sidecar answers again; the same file is
+      // re-uploaded (the incident batch is terminal and cannot restart). ----
+      verifyAndNormalize.mockImplementation(async (email) => ({ ok: true, result: validResult(email) }));
+      const recoveredBatchId = await createBatch(emails, "COLLAB_REV_BATCH_2_formatted.csv");
+      expect((await json(await startBatch(recoveredBatchId))).batch.status).toBe("running");
+      expect(await runBatchWorker(recoveredBatchId)).toBe("completed");
+
+      const recovered = await prisma.verificationBatch.findUnique({ where: { id: recoveredBatchId } });
+      expect(recovered).toMatchObject({
+        status: "completed",
+        total: 99,
+        queued: 0,
+        running: 0,
+        completed: 99,
+        failed: 0,
+        valid: 99,
+        invalid: 0,
+        risky: 0,
+        catchAll: 0,
+        unknown: 0,
+      });
+
+      const recoveredJobs = await prisma.verificationJob.findMany({ where: { batchId: recoveredBatchId } });
+      expect(recoveredJobs).toHaveLength(99);
+      for (const job of recoveredJobs) {
+        expect(job.status).toBe("done");
+        expect(job.verificationId).not.toBeNull(); // result persisted and linked
+        expect(job.lastError).toBeNull();
+      }
+      // Every verified address has exactly one stored result.
+      expect(await prisma.emailVerification.count({ where: { userId: ownerId } })).toBe(99);
+    },
+    300_000,
+  );
+});
+
+// ---------------------------------------------------------------------------
+
 describe("batch endpoints — authentication and ownership", () => {
   it("refuses unauthenticated view, start, cancel and jobs reads", async () => {
     getSession.mockResolvedValue(null);

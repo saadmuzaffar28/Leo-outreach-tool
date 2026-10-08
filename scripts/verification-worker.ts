@@ -1,4 +1,5 @@
 import "dotenv/config";
+import "./worker-alias";
 import { runBatchWorker, runVerificationWorker } from "../src/lib/verification/worker";
 
 // `--batch=<id>` runs ONE batch to completion with a batch-scoped claim:

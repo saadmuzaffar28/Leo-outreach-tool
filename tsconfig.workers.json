@@ -18,6 +18,7 @@
     "scripts/worker.ts",
     "scripts/warmup-worker.ts",
     "scripts/verification-worker.ts",
+    "scripts/worker-alias.ts",
     "src/lib/**/*.ts"
   ],
   "exclude": ["node_modules", ".next", "dist", "tests"]

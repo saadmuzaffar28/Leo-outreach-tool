@@ -1,4 +1,5 @@
 import "dotenv/config";
+import "./worker-alias";
 import { runWorker } from "../src/lib/worker";
 
 runWorker()
